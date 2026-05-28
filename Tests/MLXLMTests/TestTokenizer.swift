@@ -35,6 +35,8 @@ struct TestTokenizer: MLXLMCommon.Tokenizer {
     }
 
     func encode(text: String, addSpecialTokens: Bool) -> [Int] {
+        // TODO dkoski -- return fixed tokens, disabled for now
+        // return [92, 85, 2, 95, 55, 7, 94, 42]
         (0 ..< length).map { _ in
             Int.random(in: 1 ..< vocabularySize)
         }

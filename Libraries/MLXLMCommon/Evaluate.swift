@@ -754,6 +754,12 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
     private var pendingTokens = [Int]()
     private var pendingIndex = 0
 
+    // TODO dkoski -- expected tokens
+    var check = [
+        22, 71, 90, 45, 28, 38, 45, 90, 45, 90, 45, 28, 38, 45, 90, 45, 28, 38, 45, 90, 45, 90, 45,
+        90, 71, 90, 71, 27, 38, 17, 60, 28,
+    ]
+
     // Internal metrics
     public var promptPrefillTime: TimeInterval = 0.0
 
@@ -933,6 +939,17 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
         }
     }
 
+    mutating func verify(_ token: Int) {
+        return
+
+        // TODO dkoski disabled for now
+        //        if check[0] != token {
+        //            print("here \(token) != \(check[0])")
+        //            print("check")
+        //        }
+        //        check.remove(at: 0)
+    }
+
     mutating public func next() -> Int? {
         if let maxTokens, tokenCount >= maxTokens {
             return nil
@@ -941,6 +958,7 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
         // Drain the pending buffer first
         if pendingIndex < pendingTokens.count {
             let token = pendingTokens[pendingIndex]
+            verify(token)
             pendingIndex += 1
             tokenCount += 1
             return token
@@ -956,6 +974,7 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
         }
 
         let token = pendingTokens[pendingIndex]
+        verify(token)
         pendingIndex += 1
         tokenCount += 1
         return token

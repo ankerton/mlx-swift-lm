@@ -341,7 +341,7 @@ public class Gemma3Model: Module {
 public class Gemma3TextModel: Module, LLMModel {
 
     @ModuleInfo public var model: Gemma3Model
-    @ModuleInfo(key: "lm_head") var lmHead: Linear
+    @ModuleInfo(key: "lm_head") public var lmHead: Linear
 
     public let config: Gemma3TextConfiguration
     public var vocabularySize: Int { config.vocabularySize }

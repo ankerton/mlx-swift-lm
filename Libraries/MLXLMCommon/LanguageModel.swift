@@ -323,6 +323,32 @@ public protocol MTPSpeculativeModel {
     func mtpForward(hiddenState: MLXArray, nextTokenIds: MLXArray, cache: [KVCache]) -> MLXArray
 }
 
+/// Conformed by models that can load their MTP head from a **separate**
+/// checkpoint directory, alongside (not instead of) a fused head already
+/// present in the main checkpoint's own weights.
+///
+/// Exists because the checkpoint we actually serve
+/// (`lmstudio-community/Qwen3.6-35B-A3B-MLX-8bit`) ships **no** `mtp.*`
+/// weights at all — every MLX conversion strips them — while
+/// `mlx-community` publishes the head as its own standalone model directory
+/// (e.g. `Qwen3.6-35B-A3B-MTP-bf16`: a `config.json` + one `model.safetensors`,
+/// keys unprefixed relative to what a fused checkpoint's `mtp.*` keys would
+/// be). `attachSeparateMTPHead` reads that directory directly and applies its
+/// weights to the SAME module shape (`Qwen35MTPHead`/`Qwen35MTPDecoderLayer`)
+/// the fused path already declares — this is an additional source for the
+/// head, not a second mechanism.
+public protocol MTPHeadAttachable {
+    /// Attempts to attach an MTP head loaded from `directory`. A no-op
+    /// (returns `true`) if a fused head is already present — the fused
+    /// checkpoint takes precedence, never duplicated or replaced. Fails
+    /// closed (returns `false`, logs the reason once, throws nothing) on any
+    /// incompatibility: no `mtp_num_hidden_layers` in the directory's config,
+    /// a `hiddenSize` mismatch with the main model, no `.safetensors` found,
+    /// or a load/shape error.
+    @discardableResult
+    func attachSeparateMTPHead(from directory: URL) -> Bool
+}
+
 extension LanguageModel where Self: KVCacheDimensionProvider {
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
         // Create one cache per layer (kvHeads.count = number of layers)

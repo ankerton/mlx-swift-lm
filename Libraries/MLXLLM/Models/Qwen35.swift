@@ -756,10 +756,22 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     let configuration: Qwen35TextConfiguration
 
     @ModuleInfo(key: "lm_head") var lmHead: Linear?
-    /// Present iff `configuration.mtpNumHiddenLayers > 0` — decided at
-    /// construction from config, independent of what the loaded weight file
-    /// actually contains (module trees are built before weights are applied;
-    /// see `sanitize` and `speculationCapability`).
+    /// Present iff the loaded checkpoint's weights actually contain `mtp.*`
+    /// keys — allocated in `sanitize(weights:)`, NOT here at construction.
+    ///
+    /// **This was originally config-driven** (`mtpNumHiddenLayers > 0`) and
+    /// that was wrong: verified directly against the checkpoint we actually
+    /// serve (`lmstudio-community/Qwen3.6-35B-A3B-MLX-8bit`), its config
+    /// reports `mtp_num_hidden_layers: 1` (inherited from the full
+    /// architecture spec) while its weights carry **zero** `mtp.*` keys (the
+    /// MLX conversion strips the head). Config-driven allocation would
+    /// declare an `mtp` submodule with no backing weights, and strict
+    /// loading (`Load.swift`, `verify: [.all]` ⊇ `.allModelKeysSet`) would
+    /// throw on every load of the model we actually serve — the exact "a
+    /// model that serves today must still serve" failure this whole
+    /// mechanism exists to prevent. Weight presence is checked directly in
+    /// `sanitize`, which sees the real file; config is no longer trusted for
+    /// this decision at all.
     @ModuleInfo(key: "mtp") var mtp: Qwen35MTPHead?
 
     public init(_ args: Qwen35TextConfiguration) {
@@ -771,9 +783,10 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
         if !args.tieWordEmbeddings {
             _lmHead.wrappedValue = Linear(args.hiddenSize, args.vocabularySize, bias: false)
         }
-        if args.mtpNumHiddenLayers > 0 {
-            _mtp.wrappedValue = Qwen35MTPHead(args)
-        }
+        // `mtp` is intentionally NOT allocated here — see its doc comment.
+        // `sanitize(weights:)` allocates it iff the weight file actually has
+        // `mtp.*` keys, and `attachSeparateMTPHead(from:)` (Part-C's separate-
+        // checkpoint path) can allocate it later still, post-load.
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
@@ -846,14 +859,26 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
         }
         let shouldShiftNormWeights = hasUnsanitizedConv1d
 
-        // Keep `mtp.*` weights only when this model actually declared the
-        // head (config-driven — see `mtp`, decided at construction);
+        // Allocate `mtp` from ACTUAL WEIGHT PRESENCE, not config (see `mtp`'s
+        // doc comment for why config alone is not trustworthy here — the
+        // checkpoint we serve has `mtp_num_hidden_layers: 1` in its config
+        // and zero `mtp.*` weights). `sanitize` is the first point that sees
+        // the real file, so it's the right place for this decision, even
+        // though it's a mutating side effect in what's nominally a pure
+        // weight transform — the established precedent for post-construction
+        // module attachment in this fork (LoRA's runtime adapter loader).
+        let hasMTPWeights = weights.keys.contains { $0.contains("mtp.") }
+        if hasMTPWeights, mtp == nil {
+            let layerCount = configuration.mtpNumHiddenLayers > 0 ? configuration.mtpNumHiddenLayers : 1
+            var headConfig = configuration
+            headConfig.mtpNumHiddenLayers = layerCount
+            _mtp.wrappedValue = Qwen35MTPHead(headConfig)
+        }
+
+        // Keep `mtp.*` weights only when this model actually has the head
+        // allocated (now driven by weight presence, immediately above);
         // otherwise drop them exactly as before, so non-MTP checkpoints are
-        // unaffected. (If the config declares heads but the weight file has
-        // no matching `mtp.*` keys, `.noUnusedKeys` verification in
-        // `Load.swift` will throw at load — the same checkpoint-corruption
-        // failure mode upstream's Python raises on explicitly. This is a
-        // distinct case from "no MTP head", which is silent and unaffected.)
+        // unaffected.
         var weights = weights
         if mtp == nil {
             weights = weights.filter { !$0.key.contains("mtp.") }
@@ -910,6 +935,106 @@ extension Qwen35TextModel: MTPSpeculativeModel {
         let fused = mtp(
             hiddenState, nextTokenIds: nextTokenIds, embedTokens: model.embedTokens, cache: cache)
         return lmHead.map { $0(fused) } ?? model.embedTokens.asLinear(fused)
+    }
+}
+
+extension Qwen35TextModel: MTPHeadAttachable {
+    /// Loads `directory` as a standalone MTP-head checkpoint (config.json +
+    /// one or more `*.safetensors`, unprefixed keys — see
+    /// `MTPHeadAttachable`'s doc comment) and attaches it. Fails closed: any
+    /// problem logs once to stderr and returns `false`; never throws, never
+    /// crashes a model that otherwise loads and serves fine.
+    ///
+    /// Key mapping: **none needed.** The standalone file's keys (`fc.weight`,
+    /// `layers.0.input_layernorm.weight`, `norm.weight`, …) are already
+    /// rooted at the head itself — exactly what `Qwen35MTPHead.update(
+    /// parameters:)` expects when called directly on a freestanding head
+    /// instance (as opposed to the fused path, where those same module names
+    /// are reached via the main model's `mtp.` prefix). Loading the
+    /// standalone file onto its own `Qwen35MTPHead` object needs no renaming
+    /// at all.
+    ///
+    /// Quantization: the one real standalone release
+    /// (`mlx-community/Qwen3.6-35B-A3B-MTP-bf16`) is bf16/unquantized, and is
+    /// loaded as-is here — MLX's per-op dtype promotion handles the boundary
+    /// against an 8-bit-quantized main model's (bf16-computed) hidden state
+    /// without an explicit cast. A **quantized** standalone head is not
+    /// specially handled (no group-size/bits re-derivation from `.scales`
+    /// keys) — flagged as a known gap, not silently "handled": such a file
+    /// would fail to load here (a plain Linear can't absorb `.scales`/
+    /// `.biases` tensors), and this function's `catch` reports that plainly
+    /// rather than crashing the process.
+    public func attachSeparateMTPHead(from directory: URL) -> Bool {
+        if mtp != nil {
+            FileHandle.standardError.write(
+                Data(
+                    "mlx: fused MTP head already present — ignoring separate head directory \(directory.path)\n"
+                        .utf8))
+            return true
+        }
+        do {
+            let configData = try Data(contentsOf: directory.appendingPathComponent("config.json"))
+            let headTop = try JSONDecoder().decode(Qwen35Configuration.self, from: configData)
+            let headConfig = headTop.textConfig
+
+            guard headConfig.mtpNumHiddenLayers > 0 else {
+                FileHandle.standardError.write(
+                    Data(
+                        "mlx: MTP head directory \(directory.path) has mtp_num_hidden_layers=0 — not a valid head, ignoring\n"
+                            .utf8))
+                return false
+            }
+            guard headConfig.hiddenSize == configuration.hiddenSize else {
+                let msg: String =
+                    "mlx: MTP head directory \(directory.path) hiddenSize=\(headConfig.hiddenSize) "
+                    + "!= main model hiddenSize=\(configuration.hiddenSize) — refusing to attach\n"
+                FileHandle.standardError.write(Data(msg.utf8))
+                return false
+            }
+
+            let head = Qwen35MTPHead(headConfig)
+
+            var weights = [String: MLXArray]()
+            let files = try FileManager.default.contentsOfDirectory(
+                at: directory, includingPropertiesForKeys: nil)
+            var sawSafetensors = false
+            for file in files where file.pathExtension == "safetensors" {
+                let (w, _) = try loadArraysAndMetadata(url: file)
+                for (k, v) in w { weights[k] = v }
+                sawSafetensors = true
+            }
+            guard sawSafetensors, !weights.isEmpty else {
+                FileHandle.standardError.write(
+                    Data(
+                        "mlx: MTP head directory \(directory.path) has no *.safetensors — refusing to attach\n"
+                            .utf8))
+                return false
+            }
+            if weights.keys.contains(where: { $0.hasSuffix(".scales") }) {
+                let msg: String =
+                    "mlx: MTP head directory \(directory.path) appears to be quantized "
+                    + "(.scales keys present) — not supported by this port, refusing to attach\n"
+                FileHandle.standardError.write(Data(msg.utf8))
+                return false
+            }
+
+            let params = ModuleParameters.unflattened(weights)
+            try head.update(parameters: params, verify: [.all])
+            eval(head)
+
+            _mtp.wrappedValue = head
+            let msg: String =
+                "mlx: MTP head attached from separate checkpoint \(directory.path) "
+                + "(\(headConfig.mtpNumHiddenLayers) layer(s), hiddenSize=\(headConfig.hiddenSize))\n"
+            FileHandle.standardError.write(Data(msg.utf8))
+            return true
+        } catch {
+            FileHandle.standardError.write(
+                Data(
+                    "mlx: failed to attach MTP head from \(directory.path): \(error) — serving non-speculatively\n"
+                        .utf8))
+            return false
+        }
     }
 }
 
@@ -992,5 +1117,12 @@ extension Qwen35Model: MTPSpeculativeModel {
         -> MLXArray
     {
         languageModel.mtpForward(hiddenState: hiddenState, nextTokenIds: nextTokenIds, cache: cache)
+    }
+}
+
+extension Qwen35Model: MTPHeadAttachable {
+    @discardableResult
+    public func attachSeparateMTPHead(from directory: URL) -> Bool {
+        languageModel.attachSeparateMTPHead(from: directory)
     }
 }

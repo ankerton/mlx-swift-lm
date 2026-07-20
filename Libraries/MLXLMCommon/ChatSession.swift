@@ -587,6 +587,29 @@ public final class ChatSession {
                                 iterator: iterator,
                                 tools: tools
                             )
+                        } else if MTPSpeculationToggle.enabled,
+                            let capability = model.speculationCapability, capability.isAvailable,
+                            let mtpModel = model as? any LanguageModel & MTPSpeculativeModel
+                        {
+                            // Native MTP speculation (ch. 7B): the checkpoint
+                            // itself ships usable heads and every cache is
+                            // restorable — no draft model, no opt-in, no
+                            // per-request field. Falls through to the
+                            // standard path below whenever this doesn't hold
+                            // (older/non-MTP checkpoints, or the operator
+                            // toggle set to `off`), so behaviour there is
+                            // completely unchanged.
+                            let iterator = try MTPSpeculativeTokenIterator(
+                                input: input, model: mtpModel, cache: kvCache,
+                                parameters: generateParameters)
+
+                            (genStream, genTask) = MLXLMCommon.generateTask(
+                                promptTokenCount: input.text.tokens.size,
+                                modelConfiguration: modelConfiguration,
+                                tokenizer: tokenizer,
+                                iterator: iterator,
+                                tools: tools
+                            )
                         } else {
                             // Standard path with no speculative decoding.
                             let iterator = try TokenIterator(

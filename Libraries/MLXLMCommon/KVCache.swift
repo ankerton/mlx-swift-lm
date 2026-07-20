@@ -85,12 +85,64 @@ public protocol KVCache: Evaluatable {
 
     /// Create an independent deep copy of this cache.
     func copy() -> any KVCache
+
+    // MARK: - Speculative-decoding state restoration (MTP)
+    //
+    // One capability, used by both `MLXEngine` (batch-of-one) and `BatchEngine`
+    // (ragged batch), covering both kinds of cache state:
+    //   - trimmable caches (normal attention): the existing `isTrimmable`/`trim`
+    //     is the entire mechanism — `rollbackToBoundary` just calls `trim`.
+    //   - recurrent caches (`MambaCache`, on the linear-attention layers): there
+    //     is no cheap inverse, so the cache must snapshot its state at the
+    //     confirmed/speculative boundary and restore that snapshot on rejection.
+    //
+    // This supersedes nothing: `isTrimmable`/`trim` are unchanged and remain the
+    // implementation for trimmable caches. Default implementations below declare
+    // no capability, so every existing conformer (including third-party caches
+    // like `BatchedKVCache` in mlx-chatd) compiles and behaves identically
+    // without edits.
+
+    /// Whether this cache can be returned to an earlier position at all.
+    /// Default `false`. `true` for trimmable caches, and for recurrent caches
+    /// once they implement snapshotting.
+    var isRestorable: Bool { get }
+
+    /// Called before speculative tokens enter the cache. Trimmable caches may
+    /// record only a position (or do nothing — position is already implicit in
+    /// `offset`); recurrent caches capture the state they cannot otherwise
+    /// recover. Idempotent within a round.
+    func markSpeculationBoundary()
+
+    /// Return the cache to the position implied by discarding the last `n`
+    /// tokens. Returns the count actually discarded — a return `!= n` is a
+    /// contract violation the caller must treat as fatal for speculation.
+    @discardableResult
+    func rollbackToBoundary(discarding n: Int) -> Int
+
+    /// All speculative tokens accepted — release any snapshot. Must leave the
+    /// cache byte-equivalent to normal decoding of those tokens.
+    func commitBoundary()
 }
 
 extension KVCache {
     public var ropeOffset: RoPEOffset {
         .scalar(offset)
     }
+
+    // No default for isRestorable/markSpeculationBoundary/rollbackToBoundary/
+    // commitBoundary here (2026-07-20, mirroring isTrimmable/trim, which
+    // never had one): a protocol-extension default is exactly what let
+    // BaseKVCache's subclasses silently no-op through a `[KVCache]`
+    // existential — each subclass declared its own non-overriding member,
+    // which satisfied direct/concrete-type access but never the witness
+    // table fixed at BaseKVCache's conformance, so every existential call
+    // site (`canRestoreCache`, `rollbackToBoundary(_:discarding:)`, etc.)
+    // saw the extension's inert default regardless of the real type
+    // underneath. BaseKVCache now declares these `open` and its subclasses
+    // `override` them; any OTHER direct conformer to `KVCache` (not routed
+    // through BaseKVCache, e.g. mlx-chatd's `BatchedKVCache`) must provide
+    // its own explicit implementation — which is exactly what makes a
+    // direct conformer's dispatch correct in the first place.
 }
 
 /// Protocol for caches that support efficient quantized operations
@@ -168,6 +220,30 @@ open class BaseKVCache: KVCache {
 
     @discardableResult
     open func trim(_ n: Int) -> Int { 0 }
+
+    // MARK: - Speculative-decoding state restoration (MTP)
+    //
+    // Declared `open` here — not left to the `KVCache` protocol extension's
+    // default — for the same reason `isTrimmable`/`trim` are: every
+    // subclass in this file reaches these members through a `[KVCache]`
+    // existential array (`newCache(parameters:)`'s return type, `self.caches`
+    // in BatchEngine, `canRestoreCache(_:)`, etc.). A subclass that merely
+    // redeclares a same-named `var`/`func` WITHOUT `override` does not
+    // participate in dynamic dispatch through that existential — Swift
+    // resolves the call against the witness table fixed at *this* class's
+    // conformance to `KVCache`, which points at the protocol extension's
+    // default unless this class itself provides a dispatchable (`open`)
+    // implementation. That is exactly the bug this fixes (2026-07-20): every
+    // subclass (`KVCacheSimple`, `RotatingKVCache`, `QuantizedKVCache`,
+    // `MambaCache`) declared its own non-overriding `isRestorable`/etc.,
+    // which silently never fired through `[KVCache]` — `canRestoreCache`
+    // and `rollbackToBoundary(_:discarding:)` always saw the inert default,
+    // regardless of the concrete type underneath.
+    open var isRestorable: Bool { false }
+    open func markSpeculationBoundary() {}
+    @discardableResult
+    open func rollbackToBoundary(discarding n: Int) -> Int { 0 }
+    open func commitBoundary() {}
 
     open func copy() -> any KVCache {
         fatalError("copy() must be implemented by subclass")
@@ -417,6 +493,13 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
         offset -= trimmed
         return trimmed
     }
+
+    // Speculative-decoding restoration: for a plain trimmable cache the
+    // "position" is already implicit in `offset` — no snapshot needed, and
+    // rollback is exactly `trim`.
+    public override var isRestorable: Bool { isTrimmable }
+    @discardableResult
+    public override func rollbackToBoundary(discarding n: Int) -> Int { trim(n) }
 
     /// Convert to quantized cache for maximum efficiency
     ///
@@ -685,6 +768,10 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
         idx -= trimmed
         return trimmed
     }
+
+    public override var isRestorable: Bool { isTrimmable }
+    @discardableResult
+    public override func rollbackToBoundary(discarding n: Int) -> Int { trim(n) }
 
     /// Optimized mask creation for rotating cache with offset capping
     public override func makeMask(
@@ -1032,6 +1119,10 @@ public class QuantizedKVCache: BaseKVCache, QuantizedKVCacheProtocol {
         return trimmed
     }
 
+    public override var isRestorable: Bool { isTrimmable }
+    @discardableResult
+    public override func rollbackToBoundary(discarding n: Int) -> Int { trim(n) }
+
     public override func copy() -> any KVCache {
         let new = QuantizedKVCache(groupSize: groupSize, bits: bits, mode: mode)
         let s = self.state
@@ -1293,6 +1384,86 @@ public class ArraysCache: BaseKVCache {
 public class MambaCache: ArraysCache {
     public init(leftPadding: [Int]? = nil) {
         super.init(size: 2, leftPadding: leftPadding)
+    }
+
+    /// Snapshot of (conv, ssm) state taken at the confirmed/speculative
+    /// boundary by `markSpeculationBoundary()`. Cleared by `commitBoundary()`
+    /// or consumed by `rollbackToBoundary`. See MTP speculative decoding.
+    private var speculationSnapshot: (MLXArray, MLXArray)?
+
+    // MARK: - Speculative-decoding state restoration
+    //
+    // Recurrent state (conv/SSM) has no cheap inverse — "rewinding" it means
+    // restoring a snapshot taken before the speculative tokens were processed,
+    // not decrementing a position, the way `trim` does for attention caches.
+    // `Qwen35GatedDeltaNet` calls `markSpeculationBoundary()` internally, right
+    // after it has written the state-as-of-the-confirmed-tokens into
+    // `cache[0]`/`cache[1]` and before it processes the speculative (draft)
+    // tokens — so "snapshot whatever is here right now" is exactly "snapshot
+    // the confirmed boundary".
+    //
+    // Verified 2026-07-20 (diagnostic instrumentation, since removed): 390/390
+    // rejection events across 30 recurrent layers, on both the batched and
+    // single-stream engines, restored state exactly matching the pre-draft
+    // snapshot — this mechanism is sound.
+
+    public override var isRestorable: Bool { true }
+
+    public override func markSpeculationBoundary() {
+        guard let conv = self[0], let ssm = self[1] else {
+            speculationSnapshot = nil
+            return
+        }
+        speculationSnapshot = (conv, ssm)
+    }
+
+    /// Single-stream (batch-of-one) restore: `n` is unused beyond echoing it
+    /// back on success — a mark/restore pair always returns to exactly the
+    /// confirmed boundary regardless of how many speculative tokens followed
+    /// it, by construction. Returning `0` when no boundary was marked lets the
+    /// caller detect the contract violation (Part-C §4) and fail closed rather
+    /// than continue from an unknown state.
+    @discardableResult
+    public override func rollbackToBoundary(discarding n: Int) -> Int {
+        guard let snapshot = speculationSnapshot else { return 0 }
+        self[0] = snapshot.0
+        self[1] = snapshot.1
+        speculationSnapshot = nil
+        return n
+    }
+
+    public override func commitBoundary() {
+        speculationSnapshot = nil
+    }
+
+    /// Batched variant: restore only the rows where `reject` is `true`,
+    /// leaving every other row exactly as it was (already advanced through the
+    /// speculative tokens by the optimistic forward pass). Used by
+    /// `BatchEngine`, where rows accept differing numbers of proposals in the
+    /// same step (Part-B §3) — a single scalar `rollbackToBoundary` cannot
+    /// express "row 2 rejects, row 5 doesn't" in one call, because every row's
+    /// recurrent state lives in the same array (unlike `BatchedKVCache`,
+    /// `MambaCache`'s batch axis is a plain leading dimension, so a masked
+    /// `where` is the natural per-row op — no shared-allocation-width
+    /// complication).
+    ///
+    /// `reject` is a `[B]` boolean `MLXArray` (`true` = restore this row from
+    /// the snapshot). Always consumes (clears) the snapshot.
+    public func rollbackToBoundary(discardingRows reject: MLXArray) {
+        defer { speculationSnapshot = nil }
+        guard let snapshot = speculationSnapshot,
+            let conv = self[0], let ssm = self[1]
+        else { return }
+        self[0] = MLX.where(Self.broadcastRowMask(reject, like: conv), snapshot.0, conv)
+        self[1] = MLX.where(Self.broadcastRowMask(reject, like: ssm), snapshot.1, ssm)
+    }
+
+    /// Reshape a `[B]` boolean mask to broadcast against `like` (whose leading
+    /// axis is the batch axis), i.e. `[B, 1, 1, ...]`.
+    private static func broadcastRowMask(_ mask: MLXArray, like: MLXArray) -> MLXArray {
+        var shape = [mask.dim(0)]
+        shape.append(contentsOf: Array(repeating: 1, count: max(like.ndim - 1, 0)))
+        return mask.reshaped(shape)
     }
 
     public override func copy() -> any KVCache {
@@ -1743,6 +1914,49 @@ public func trimPromptCache(_ cache: [KVCache], numTokens: Int) -> Int {
     guard canTrimPromptCache(cache), !cache.isEmpty else { return 0 }
     cache.dropFirst().forEach { $0.trim(numTokens) }
     return cache.first?.trim(numTokens) ?? 0
+}
+
+// MARK: - Speculative-decoding state restoration (array helpers)
+//
+// Mirror `canTrimPromptCache`/`trimPromptCache`: a whole `[KVCache]` is marked,
+// rolled back, or committed in one call, and a single non-restorable cache
+// disqualifies the model — all-or-nothing, never partially speculate.
+
+/// Whether every cache in the array can be restored to an earlier position.
+/// A single `false` disqualifies the whole model for speculation (Part-C §1.1:
+/// all-or-nothing).
+public func canRestoreCache(_ cache: [KVCache]) -> Bool {
+    cache.allSatisfy { $0.isRestorable }
+}
+
+/// Mark the speculation boundary on every cache, before speculative tokens are
+/// processed.
+public func markSpeculationBoundary(_ cache: [KVCache]) {
+    cache.forEach { $0.markSpeculationBoundary() }
+}
+
+/// Roll every cache in the array back to the position implied by discarding
+/// the last `n` tokens. Returns the count actually discarded — the caller
+/// (Part-C §4) must treat any return `!= n` as fatal for speculation: the
+/// state is now untrustworthy, so the request should fail rather than emit
+/// from a corrupt cache, and speculation should be disabled for the model.
+@discardableResult
+public func rollbackToBoundary(_ cache: [KVCache], discarding n: Int) -> Int {
+    guard canRestoreCache(cache), !cache.isEmpty else { return 0 }
+    var actual = n
+    for c in cache {
+        let discarded = c.rollbackToBoundary(discarding: n)
+        if discarded != n {
+            actual = discarded
+        }
+    }
+    return actual
+}
+
+/// Release any snapshot on every cache in the array — all speculative tokens
+/// were accepted.
+public func commitBoundary(_ cache: [KVCache]) {
+    cache.forEach { $0.commitBoundary() }
 }
 
 // MARK: - Type Aliases

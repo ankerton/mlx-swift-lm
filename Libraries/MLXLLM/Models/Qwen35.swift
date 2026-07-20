@@ -41,6 +41,15 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
     var ropeScaling: [String: StringOrNumber]?
     var fullAttentionInterval: Int = 4
 
+    // MTP (multi-token-prediction) fields. Default 0 ⇒ no head, checkpoints
+    // without MTP decode unchanged (Part-C §1.3).
+    var mtpNumHiddenLayers: Int = 0
+    // Present in some checkpoints' config; not yet supported (see
+    // Qwen35TextModel.speculationCapability) — decoded so it round-trips
+    // rather than silently ignored, but a `true` value here disables
+    // speculation rather than guessing at unimplemented behaviour.
+    var mtpUseDedicatedEmbeddings: Bool = false
+
     // MoE fields
     var numExperts: Int = 0
     var numExpertsPerTok: Int = 0
@@ -71,6 +80,8 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
         case headDim = "head_dim"
         case ropeScaling = "rope_scaling"
         case fullAttentionInterval = "full_attention_interval"
+        case mtpNumHiddenLayers = "mtp_num_hidden_layers"
+        case mtpUseDedicatedEmbeddings = "mtp_use_dedicated_embeddings"
         case numExperts = "num_experts"
         case numExpertsPerTok = "num_experts_per_tok"
         case decoderSparseStep = "decoder_sparse_step"
@@ -117,6 +128,10 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
         self.headDim = try container.decodeIfPresent(Int.self, forKey: .headDim)
         self.fullAttentionInterval =
             try container.decodeIfPresent(Int.self, forKey: .fullAttentionInterval) ?? 4
+        self.mtpNumHiddenLayers =
+            try container.decodeIfPresent(Int.self, forKey: .mtpNumHiddenLayers) ?? 0
+        self.mtpUseDedicatedEmbeddings =
+            try container.decodeIfPresent(Bool.self, forKey: .mtpUseDedicatedEmbeddings) ?? false
 
         // MoE fields
         self.numExperts = try container.decodeIfPresent(Int.self, forKey: .numExperts) ?? 0
@@ -225,43 +240,34 @@ final class Qwen35GatedDeltaNet: Module {
         super.init()
     }
 
-    func callAsFunction(
-        _ inputs: MLXArray,
-        mask: MLXArray? = nil,
-        cache: MambaCache? = nil
-    ) -> MLXArray {
-        let B = inputs.dim(0)
-        let S = inputs.dim(1)
+    /// Process one contiguous chunk of the sequence through conv1d + the gated
+    /// delta-net recurrence, given an explicit starting (conv, ssm) state.
+    /// Factored out of `callAsFunction` so speculative verification can call it
+    /// twice — once for the confirmed tokens, once for the draft tokens — with
+    /// the recurrent state snapshotted at the boundary between the two calls.
+    /// For the ordinary (non-speculative) path this is called once over the
+    /// whole sequence and is numerically identical to the pre-MTP code.
+    private func processChunk(
+        qkvChunk: MLXArray, aChunk: MLXArray, bChunk: MLXArray,
+        convState: MLXArray, ssmState: MLXArray?, mask: MLXArray?
+    ) -> (out: MLXArray, convState: MLXArray, ssmState: MLXArray?) {
+        let B = qkvChunk.dim(0)
+        let Sc = qkvChunk.dim(1)
 
-        var qkv = inProjQKV(inputs)
-        let z = inProjZ(inputs).reshaped(B, S, numVHeads, headVDim)
-        let b = inProjB(inputs)
-        let a = inProjA(inputs)
-
-        let convState: MLXArray
-        if let cacheState = cache?[0] {
-            convState = cacheState
-        } else {
-            convState = MLXArray.zeros([B, convKernelSize - 1, convDim], dtype: inputs.dtype)
-        }
-
+        var qkv = qkvChunk
         if let mask {
             qkv = MLX.where(mask[.ellipsis, .newAxis], qkv, 0)
         }
 
         let convInput = concatenated([convState, qkv], axis: 1)
-        if let cache {
-            cache[0] = convInput[0..., (-(convKernelSize - 1))...]
-        }
-
+        let newConvState = convInput[0..., (-(convKernelSize - 1))...]
         let convOut = silu(conv1d(convInput))
 
         let convSplit = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
-        let q = convSplit[0].reshaped(B, S, numKHeads, headKDim)
-        let k = convSplit[1].reshaped(B, S, numKHeads, headKDim)
-        let v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
+        let q = convSplit[0].reshaped(B, Sc, numKHeads, headKDim)
+        let k = convSplit[1].reshaped(B, Sc, numKHeads, headKDim)
+        let v = convSplit[2].reshaped(B, Sc, numVHeads, headVDim)
 
-        var state = cache?[1]
         let dtype = q.dtype
         let invScale = pow(Float(headKDim), -0.5)
         let qNormed =
@@ -271,26 +277,96 @@ final class Qwen35GatedDeltaNet: Module {
             MLXArray(invScale).asType(dtype)
             * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
 
-        var out: MLXArray
-
-        (out, state) = gatedDeltaUpdate(
+        let (out, newSsmState) = gatedDeltaUpdate(
             q: qNormed,
             k: kNormed,
             v: v,
-            a: a,
-            b: b,
+            a: aChunk,
+            b: bChunk,
             aLog: aLog,
             dtBias: dtBias,
-            state: state,
+            state: ssmState,
             mask: mask
         )
 
-        if let cache {
-            cache[1] = state
+        return (out, newConvState, newSsmState)
+    }
+
+    /// - Parameter confirmedPrefix: how many of the leading `S` positions are
+    ///   already-confirmed tokens (speculative verification); `0` outside
+    ///   speculative decoding. When `0 < confirmedPrefix < S`, the confirmed
+    ///   and draft sub-ranges are processed as two chunks so the recurrent
+    ///   state can be snapshotted at the boundary between them
+    ///   (`cache.markSpeculationBoundary()`) — the snapshot the engine
+    ///   restores via `cache.rollbackToBoundary` on rejection (Part-B §2).
+    func callAsFunction(
+        _ inputs: MLXArray,
+        mask: MLXArray? = nil,
+        cache: MambaCache? = nil,
+        confirmedPrefix: Int = 0
+    ) -> MLXArray {
+        let B = inputs.dim(0)
+        let S = inputs.dim(1)
+
+        let qkv = inProjQKV(inputs)
+        let z = inProjZ(inputs).reshaped(B, S, numVHeads, headVDim)
+        let b = inProjB(inputs)
+        let a = inProjA(inputs)
+
+        let initialConvState: MLXArray
+        if let cacheState = cache?[0] {
+            initialConvState = cacheState
+        } else {
+            initialConvState = MLXArray.zeros(
+                [B, convKernelSize - 1, convDim], dtype: inputs.dtype)
+        }
+        let initialSsmState = cache?[1]
+
+        let out: MLXArray
+
+        if confirmedPrefix > 0 && confirmedPrefix < S {
+            let (outC, convC, ssmC) = processChunk(
+                qkvChunk: qkv[0..., ..<confirmedPrefix],
+                aChunk: a[0..., ..<confirmedPrefix],
+                bChunk: b[0..., ..<confirmedPrefix],
+                convState: initialConvState, ssmState: initialSsmState,
+                mask: mask?[0..., ..<confirmedPrefix]
+            )
+            if let cache {
+                // State as of exactly the confirmed tokens — the boundary the
+                // recurrent cache must be able to return to on rejection.
+                cache[0] = convC
+                cache[1] = ssmC
+                cache.markSpeculationBoundary()
+            }
+            let (outD, convF, ssmF) = processChunk(
+                qkvChunk: qkv[0..., confirmedPrefix...],
+                aChunk: a[0..., confirmedPrefix...],
+                bChunk: b[0..., confirmedPrefix...],
+                convState: convC, ssmState: ssmC,
+                mask: mask?[0..., confirmedPrefix...]
+            )
+            if let cache {
+                // Optimistic advance through the draft tokens too — rolled
+                // back by the engine if verification rejects them.
+                cache[0] = convF
+                cache[1] = ssmF
+            }
+            out = concatenated([outC, outD], axis: 1)
+        } else {
+            let (outFull, convF, ssmF) = processChunk(
+                qkvChunk: qkv, aChunk: a, bChunk: b,
+                convState: initialConvState, ssmState: initialSsmState, mask: mask
+            )
+            if let cache {
+                cache[0] = convF
+                cache[1] = ssmF
+            }
+            out = outFull
         }
 
-        out = norm(out, gate: z)
-        return outProj(out.reshaped(B, S, -1))
+        let gated = norm(out, gate: z)
+        return outProj(gated.reshaped(B, S, -1))
     }
 }
 
@@ -479,11 +555,14 @@ final class Qwen35DecoderLayer: Module {
         _ x: MLXArray,
         attentionMask: MLXFast.ScaledDotProductAttentionMaskMode,
         ssmMask: MLXArray?,
-        cache: KVCache?
+        cache: KVCache?,
+        confirmedPrefix: Int = 0
     ) -> MLXArray {
         let r: MLXArray
         if isLinear {
-            r = linearAttn!(inputLayerNorm(x), mask: ssmMask, cache: cache as? MambaCache)
+            r = linearAttn!(
+                inputLayerNorm(x), mask: ssmMask, cache: cache as? MambaCache,
+                confirmedPrefix: confirmedPrefix)
         } else {
             r = selfAttn!(inputLayerNorm(x), mask: attentionMask, cache: cache)
         }
@@ -524,7 +603,17 @@ public class Qwen35TextModelInner: Module {
         super.init()
     }
 
-    func callAsFunction(_ inputs: MLXArray, cache: [KVCache?]? = nil) -> MLXArray {
+    /// Backbone forward, returning the **pre-final-norm** hidden state — what
+    /// the MTP head fuses with the next token's embedding (Part-A §4). The
+    /// public `callAsFunction` below is a thin wrapper applying `norm` on top;
+    /// this split is a pure refactor (identical output for `confirmedPrefix: 0`)
+    /// so both entry points share one implementation.
+    ///
+    /// - Parameter confirmedPrefix: forwarded to each linear-attention layer as
+    ///   its speculative-verification snapshot boundary (`0` = no speculation).
+    func hiddenStates(
+        _ inputs: MLXArray, cache: [KVCache?]? = nil, confirmedPrefix: Int = 0
+    ) -> MLXArray {
         var hiddenStates = embedTokens(inputs)
 
         var cacheArray = cache
@@ -541,10 +630,121 @@ public class Qwen35TextModelInner: Module {
                 layer.isLinear
                 ? MLXFast.ScaledDotProductAttentionMaskMode.none : faMask
             hiddenStates = layer(
-                hiddenStates, attentionMask: attnMask, ssmMask: mask, cache: cacheArray?[i])
+                hiddenStates, attentionMask: attnMask, ssmMask: mask, cache: cacheArray?[i],
+                confirmedPrefix: confirmedPrefix)
         }
 
-        return norm(hiddenStates)
+        return hiddenStates
+    }
+
+    func callAsFunction(_ inputs: MLXArray, cache: [KVCache?]? = nil) -> MLXArray {
+        norm(hiddenStates(inputs, cache: cache))
+    }
+}
+
+// MARK: - MTP (multi-token-prediction) head
+//
+// ml-explore/mlx-lm#990 (reference to port; Part-A §4). Predicts token `t+2`
+// from the backbone's pre-final-norm hidden state at `t` and the (sampled)
+// token `t+1`'s embedding. No second resident model — the fused head lives
+// inside Qwen3.6's own checkpoint.
+//
+// Weight key names verified against an actual checkpoint (not assumed): the
+// standalone-drafter release `mlx-community/Qwen3.6-35B-A3B-MTP-bf16` (its own
+// `model.safetensors` header, fetched as a metadata-only HTTP range read) and
+// a merged, MTP-preserving quantized checkpoint
+// (`stamsam/...-MLX-oQ4-MTP/model.safetensors.index.json`), whose keys are
+// `language_model.mtp.{fc,norm,pre_fc_norm_hidden,pre_fc_norm_embedding}.weight`
+// and `language_model.mtp.layers.<i>.{input_layernorm,post_attention_layernorm,
+// self_attn.*,mlp.*}` — i.e. every MTP key is `mtp.`-prefixed once merged into
+// a full checkpoint, and the `mlp.*` / `self_attn.*` sub-keys are byte-for-byte
+// the same names `Qwen35SparseMoeBlock` / `Qwen35Attention` already declare.
+// No `eh_proj` / `shared_head` / `nextn`-style bare keys were found for this
+// architecture — that caution in Part-A §3.6 does not materialize for Qwen3.6.
+
+/// Full-attention-only transformer layer for the MTP head — reuses
+/// `Qwen35Attention` and the backbone's dense/MoE MLP block directly (verified
+/// same weight-key shape as the backbone's non-linear decoder layer); the MTP
+/// head never has a linear-attention (`GatedDeltaNet`) variant.
+final class Qwen35MTPDecoderLayer: Module {
+    @ModuleInfo(key: "self_attn") var selfAttn: Qwen35Attention
+    @ModuleInfo(key: "input_layernorm") var inputLayerNorm: RMSNorm
+    @ModuleInfo(key: "post_attention_layernorm") var postAttentionLayerNorm: RMSNorm
+    @ModuleInfo(key: "mlp") var mlp: Module
+
+    init(_ args: Qwen35TextConfiguration) {
+        _selfAttn.wrappedValue = Qwen35Attention(args)
+        _inputLayerNorm.wrappedValue = RMSNorm(dimensions: args.hiddenSize, eps: args.rmsNormEps)
+        _postAttentionLayerNorm.wrappedValue = RMSNorm(
+            dimensions: args.hiddenSize, eps: args.rmsNormEps)
+        if args.numExperts > 0 {
+            _mlp.wrappedValue = Qwen35SparseMoeBlock(args)
+        } else {
+            _mlp.wrappedValue = Qwen3NextMLP(
+                dimensions: args.hiddenSize, hiddenDimensions: args.intermediateSize)
+        }
+        super.init()
+    }
+
+    func callAsFunction(
+        _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
+    ) -> MLXArray {
+        let r = selfAttn(inputLayerNorm(x), mask: mask, cache: cache)
+        let h = x + r
+        return h + (mlp as! UnaryLayer)(postAttentionLayerNorm(h))
+    }
+}
+
+/// Multi-token-prediction head. Logits are **not** produced here — the caller
+/// (`Qwen35TextModel.mtpForward`) applies the shared `lm_head` /
+/// embedding-as-linear, exactly like the backbone does, so the head never
+/// duplicates the output projection.
+final class Qwen35MTPHead: Module {
+    @ModuleInfo(key: "pre_fc_norm_hidden") var preFcNormHidden: RMSNorm
+    @ModuleInfo(key: "pre_fc_norm_embedding") var preFcNormEmbedding: RMSNorm
+    @ModuleInfo(key: "fc") var fc: Linear
+    // Plain (non-@ModuleInfo) array, matching the backbone's own `layers`
+    // convention (Qwen35TextModelInner.layers) — MLX Swift's reflection uses
+    // the Swift property name as the key path segment, which is already
+    // "layers", matching the checkpoint's `mtp.layers.<i>.*` verbatim.
+    let layers: [Qwen35MTPDecoderLayer]
+    @ModuleInfo(key: "norm") var norm: RMSNorm
+
+    init(_ args: Qwen35TextConfiguration) {
+        _preFcNormHidden.wrappedValue = RMSNorm(dimensions: args.hiddenSize, eps: args.rmsNormEps)
+        _preFcNormEmbedding.wrappedValue = RMSNorm(
+            dimensions: args.hiddenSize, eps: args.rmsNormEps)
+        _fc.wrappedValue = Linear(args.hiddenSize * 2, args.hiddenSize, bias: false)
+        self.layers = (0 ..< max(args.mtpNumHiddenLayers, 0)).map { _ in
+            Qwen35MTPDecoderLayer(args)
+        }
+        _norm.wrappedValue = RMSNorm(dimensions: args.hiddenSize, eps: args.rmsNormEps)
+        super.init()
+    }
+
+    /// - Parameters:
+    ///   - hiddenState: backbone pre-final-norm hidden state, `[B, N, H]`.
+    ///   - nextTokenIds: the token(s) positionally following `hiddenState`, `[B, N]`.
+    ///   - embedTokens: the backbone's embedding table (shared — not duplicated
+    ///     here; `mtp_use_dedicated_embeddings` is not supported, see
+    ///     `Qwen35TextModel.speculationCapability`).
+    ///   - cache: the MTP head's own KV cache — independent of the backbone's,
+    ///     one entry per MTP layer (`Qwen35TextModel.makeMTPCache()`).
+    /// - Returns: fused, normed hidden state `[B, N, H]` — not logits.
+    func callAsFunction(
+        _ hiddenState: MLXArray, nextTokenIds: MLXArray, embedTokens: Embedding,
+        cache: [KVCache]
+    ) -> MLXArray {
+        let e = preFcNormEmbedding(embedTokens(nextTokenIds))
+        let h = preFcNormHidden(hiddenState)
+        var fused = fc(concatenated([e, h], axis: -1))
+
+        let mask = createAttentionMask(h: fused, cache: cache.first)
+        for (layer, c) in zip(layers, cache) {
+            fused = layer(fused, mask: mask, cache: c)
+        }
+
+        return norm(fused)
     }
 }
 
@@ -556,6 +756,23 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     let configuration: Qwen35TextConfiguration
 
     @ModuleInfo(key: "lm_head") var lmHead: Linear?
+    /// Present iff the loaded checkpoint's weights actually contain `mtp.*`
+    /// keys — allocated in `sanitize(weights:)`, NOT here at construction.
+    ///
+    /// **This was originally config-driven** (`mtpNumHiddenLayers > 0`) and
+    /// that was wrong: verified directly against the checkpoint we actually
+    /// serve (`lmstudio-community/Qwen3.6-35B-A3B-MLX-8bit`), its config
+    /// reports `mtp_num_hidden_layers: 1` (inherited from the full
+    /// architecture spec) while its weights carry **zero** `mtp.*` keys (the
+    /// MLX conversion strips the head). Config-driven allocation would
+    /// declare an `mtp` submodule with no backing weights, and strict
+    /// loading (`Load.swift`, `verify: [.all]` ⊇ `.allModelKeysSet`) would
+    /// throw on every load of the model we actually serve — the exact "a
+    /// model that serves today must still serve" failure this whole
+    /// mechanism exists to prevent. Weight presence is checked directly in
+    /// `sanitize`, which sees the real file; config is no longer trusted for
+    /// this decision at all.
+    @ModuleInfo(key: "mtp") var mtp: Qwen35MTPHead?
 
     public init(_ args: Qwen35TextConfiguration) {
         self.configuration = args
@@ -566,6 +783,10 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
         if !args.tieWordEmbeddings {
             _lmHead.wrappedValue = Linear(args.hiddenSize, args.vocabularySize, bias: false)
         }
+        // `mtp` is intentionally NOT allocated here — see its doc comment.
+        // `sanitize(weights:)` allocates it iff the weight file actually has
+        // `mtp.*` keys, and `attachSeparateMTPHead(from:)` (Part-C's separate-
+        // checkpoint path) can allocate it later still, post-load.
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
@@ -578,6 +799,19 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
         return out
     }
 
+    /// Speculative-decoding-aware forward (Part-C §1.2). Additive: the plain
+    /// `callAsFunction(_:cache:)` above is untouched. `confirmedPrefix` reaches
+    /// the linear-attention layers, which use it as their snapshot boundary;
+    /// `hidden` is the pre-final-norm state the MTP head needs.
+    public func callAsFunction(
+        _ inputs: MLXArray, cache: [KVCache]?, confirmedPrefix: Int
+    ) -> (logits: MLXArray, hidden: MLXArray?) {
+        let preNorm = model.hiddenStates(inputs, cache: cache, confirmedPrefix: confirmedPrefix)
+        let normed = model.norm(preNorm)
+        let logits = lmHead.map { $0(normed) } ?? model.embedTokens.asLinear(normed)
+        return (logits, preNorm)
+    }
+
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
         return model.layers.map { layer in
             if layer.isLinear {
@@ -587,14 +821,86 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
         }
     }
 
+    /// Whether this model can speculate — computed once at load (Part-C §1.4).
+    /// `mtp_use_dedicated_embeddings` is not supported by this port (the head
+    /// always shares the backbone's embedding table); a checkpoint requesting
+    /// it fails closed to non-speculative service rather than silently
+    /// producing wrong fused-embedding input.
+    public var speculationCapability: SpeculationCapability? {
+        guard let mtp, !configuration.mtpUseDedicatedEmbeddings else {
+            let reason =
+                configuration.mtpUseDedicatedEmbeddings
+                ? "mtp_use_dedicated_embeddings=true is not supported by this port "
+                    + "(shared-embedding MTP head only) — serving non-speculatively"
+                : "checkpoint has no MTP head (mtp_num_hidden_layers=0 or missing mtp.* weights)"
+            return SpeculationCapability(hasHeads: false, allCachesRestorable: false, reason: reason)
+        }
+        let scratchCache = newCache(parameters: nil)
+        let restorable = canRestoreCache(scratchCache)
+        // Temporary diagnostic (2026-07-20): the reason string used to be a
+        // flat, unconditional sentence with no per-layer detail. The real
+        // served checkpoint reported `not restorable` despite every layer
+        // `newCache()` can produce (MambaCache / KVCacheSimple) being
+        // unconditionally `isRestorable == true` by static reading — this
+        // enriches the message with the offending indices/types so the next
+        // load tells us directly rather than requiring another synthetic
+        // repro. Remove once the discrepancy is understood.
+        let reason: String?
+        if restorable {
+            reason = nil
+        } else {
+            let bad = scratchCache.enumerated().compactMap { i, c -> String? in
+                c.isRestorable ? nil : "\(i):\(type(of: c))"
+            }
+            reason =
+                "one or more cache types in this model cannot be restored "
+                + "(non-restorable: [\(bad.joined(separator: ", "))] of \(scratchCache.count) total)"
+        }
+        return SpeculationCapability(
+            hasHeads: true, allCachesRestorable: restorable, proposalDepth: 1, reason: reason)
+    }
+
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
-        let hasMTPWeights = weights.keys.contains { $0.contains("mtp.") }
+        // --- The trap (Part-A §3.6 / Part-C §1.3) ---
+        // The presence of `mtp.` keys used to be OR'd into the norm-shift
+        // signal. That conflated two unrelated things: "is this a raw
+        // (unsanitized) HF checkpoint" vs "does this checkpoint carry MTP
+        // weights". An already-converted MLX checkpoint that happens to carry
+        // `mtp.*` weights must NOT be shifted again. Detection now fires on
+        // exactly the condition it always should have: unsanitized
+        // (PyTorch-layout) conv1d weights — mirroring the fix upstream landed
+        // in ml-explore/mlx-lm#990 itself (its own commit message: "norm +1
+        // shift now triggered only on raw HF checkpoints ... not on presence
+        // of MTP weights").
         let hasUnsanitizedConv1d = weights.contains { key, value in
             key.contains("conv1d.weight") && value.dim(-1) != 1
         }
-        let shouldShiftNormWeights = hasMTPWeights || hasUnsanitizedConv1d
+        let shouldShiftNormWeights = hasUnsanitizedConv1d
 
-        var weights = weights.filter { !$0.key.contains("mtp.") }
+        // Allocate `mtp` from ACTUAL WEIGHT PRESENCE, not config (see `mtp`'s
+        // doc comment for why config alone is not trustworthy here — the
+        // checkpoint we serve has `mtp_num_hidden_layers: 1` in its config
+        // and zero `mtp.*` weights). `sanitize` is the first point that sees
+        // the real file, so it's the right place for this decision, even
+        // though it's a mutating side effect in what's nominally a pure
+        // weight transform — the established precedent for post-construction
+        // module attachment in this fork (LoRA's runtime adapter loader).
+        let hasMTPWeights = weights.keys.contains { $0.contains("mtp.") }
+        if hasMTPWeights, mtp == nil {
+            let layerCount = configuration.mtpNumHiddenLayers > 0 ? configuration.mtpNumHiddenLayers : 1
+            var headConfig = configuration
+            headConfig.mtpNumHiddenLayers = layerCount
+            _mtp.wrappedValue = Qwen35MTPHead(headConfig)
+        }
+
+        // Keep `mtp.*` weights only when this model actually has the head
+        // allocated (now driven by weight presence, immediately above);
+        // otherwise drop them exactly as before, so non-MTP checkpoints are
+        // unaffected.
+        var weights = weights
+        if mtp == nil {
+            weights = weights.filter { !$0.key.contains("mtp.") }
+        }
 
         if configuration.tieWordEmbeddings {
             weights["lm_head.weight"] = nil
@@ -606,6 +912,10 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
             "model.norm.weight",
             ".q_norm.weight",
             ".k_norm.weight",
+            // MTP-specific norms (not covered by the patterns above).
+            ".pre_fc_norm_hidden.weight",
+            ".pre_fc_norm_embedding.weight",
+            "mtp.norm.weight",
         ]
 
         for k in Array(weights.keys) {
@@ -623,6 +933,126 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
         }
 
         return weights
+    }
+}
+
+extension Qwen35TextModel: MTPSpeculativeModel {
+    public func makeMTPCache() -> [KVCache] {
+        guard let mtp else { return [] }
+        return mtp.layers.map { _ in KVCacheSimple() }
+    }
+
+    public func mtpForward(hiddenState: MLXArray, nextTokenIds: MLXArray, cache: [KVCache])
+        -> MLXArray
+    {
+        guard let mtp else {
+            fatalError(
+                "mtpForward called on a model with no MTP head — check speculationCapability first"
+            )
+        }
+        let fused = mtp(
+            hiddenState, nextTokenIds: nextTokenIds, embedTokens: model.embedTokens, cache: cache)
+        return lmHead.map { $0(fused) } ?? model.embedTokens.asLinear(fused)
+    }
+}
+
+extension Qwen35TextModel: MTPHeadAttachable {
+    /// Loads `directory` as a standalone MTP-head checkpoint (config.json +
+    /// one or more `*.safetensors`, unprefixed keys — see
+    /// `MTPHeadAttachable`'s doc comment) and attaches it. Fails closed: any
+    /// problem logs once to stderr and returns `false`; never throws, never
+    /// crashes a model that otherwise loads and serves fine.
+    ///
+    /// Key mapping: **none needed.** The standalone file's keys (`fc.weight`,
+    /// `layers.0.input_layernorm.weight`, `norm.weight`, …) are already
+    /// rooted at the head itself — exactly what `Qwen35MTPHead.update(
+    /// parameters:)` expects when called directly on a freestanding head
+    /// instance (as opposed to the fused path, where those same module names
+    /// are reached via the main model's `mtp.` prefix). Loading the
+    /// standalone file onto its own `Qwen35MTPHead` object needs no renaming
+    /// at all.
+    ///
+    /// Quantization: the one real standalone release
+    /// (`mlx-community/Qwen3.6-35B-A3B-MTP-bf16`) is bf16/unquantized, and is
+    /// loaded as-is here — MLX's per-op dtype promotion handles the boundary
+    /// against an 8-bit-quantized main model's (bf16-computed) hidden state
+    /// without an explicit cast. A **quantized** standalone head is not
+    /// specially handled (no group-size/bits re-derivation from `.scales`
+    /// keys) — flagged as a known gap, not silently "handled": such a file
+    /// would fail to load here (a plain Linear can't absorb `.scales`/
+    /// `.biases` tensors), and this function's `catch` reports that plainly
+    /// rather than crashing the process.
+    public func attachSeparateMTPHead(from directory: URL) -> Bool {
+        if mtp != nil {
+            FileHandle.standardError.write(
+                Data(
+                    "mlx: fused MTP head already present — ignoring separate head directory \(directory.path)\n"
+                        .utf8))
+            return true
+        }
+        do {
+            let configData = try Data(contentsOf: directory.appendingPathComponent("config.json"))
+            let headTop = try JSONDecoder().decode(Qwen35Configuration.self, from: configData)
+            let headConfig = headTop.textConfig
+
+            guard headConfig.mtpNumHiddenLayers > 0 else {
+                FileHandle.standardError.write(
+                    Data(
+                        "mlx: MTP head directory \(directory.path) has mtp_num_hidden_layers=0 — not a valid head, ignoring\n"
+                            .utf8))
+                return false
+            }
+            guard headConfig.hiddenSize == configuration.hiddenSize else {
+                let msg: String =
+                    "mlx: MTP head directory \(directory.path) hiddenSize=\(headConfig.hiddenSize) "
+                    + "!= main model hiddenSize=\(configuration.hiddenSize) — refusing to attach\n"
+                FileHandle.standardError.write(Data(msg.utf8))
+                return false
+            }
+
+            let head = Qwen35MTPHead(headConfig)
+
+            var weights = [String: MLXArray]()
+            let files = try FileManager.default.contentsOfDirectory(
+                at: directory, includingPropertiesForKeys: nil)
+            var sawSafetensors = false
+            for file in files where file.pathExtension == "safetensors" {
+                let (w, _) = try loadArraysAndMetadata(url: file)
+                for (k, v) in w { weights[k] = v }
+                sawSafetensors = true
+            }
+            guard sawSafetensors, !weights.isEmpty else {
+                FileHandle.standardError.write(
+                    Data(
+                        "mlx: MTP head directory \(directory.path) has no *.safetensors — refusing to attach\n"
+                            .utf8))
+                return false
+            }
+            if weights.keys.contains(where: { $0.hasSuffix(".scales") }) {
+                let msg: String =
+                    "mlx: MTP head directory \(directory.path) appears to be quantized "
+                    + "(.scales keys present) — not supported by this port, refusing to attach\n"
+                FileHandle.standardError.write(Data(msg.utf8))
+                return false
+            }
+
+            let params = ModuleParameters.unflattened(weights)
+            try head.update(parameters: params, verify: [.all])
+            eval(head)
+
+            _mtp.wrappedValue = head
+            let msg: String =
+                "mlx: MTP head attached from separate checkpoint \(directory.path) "
+                + "(\(headConfig.mtpNumHiddenLayers) layer(s), hiddenSize=\(headConfig.hiddenSize))\n"
+            FileHandle.standardError.write(Data(msg.utf8))
+            return true
+        } catch {
+            FileHandle.standardError.write(
+                Data(
+                    "mlx: failed to attach MTP head from \(directory.path): \(error) — serving non-speculatively\n"
+                        .utf8))
+            return false
+        }
     }
 }
 
@@ -649,6 +1079,20 @@ public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider {
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         languageModel(inputs, cache: cache)
+    }
+
+    /// Passthrough — `LLMModelFactory` returns this wrapper as the concrete
+    /// `any LanguageModel`, so the confirmed-prefix overload and speculation
+    /// capability must be forwarded here, not just implemented on the inner
+    /// `Qwen35TextModel` (which no caller outside this file ever sees).
+    public func callAsFunction(
+        _ inputs: MLXArray, cache: [KVCache]?, confirmedPrefix: Int
+    ) -> (logits: MLXArray, hidden: MLXArray?) {
+        languageModel(inputs, cache: cache, confirmedPrefix: confirmedPrefix)
+    }
+
+    public var speculationCapability: SpeculationCapability? {
+        languageModel.speculationCapability
     }
 
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
@@ -679,5 +1123,24 @@ public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider {
 extension Qwen35Model: LoRAModel {
     public var loraLayers: [Module] {
         languageModel.model.layers
+    }
+}
+
+extension Qwen35Model: MTPSpeculativeModel {
+    public func makeMTPCache() -> [KVCache] {
+        languageModel.makeMTPCache()
+    }
+
+    public func mtpForward(hiddenState: MLXArray, nextTokenIds: MLXArray, cache: [KVCache])
+        -> MLXArray
+    {
+        languageModel.mtpForward(hiddenState: hiddenState, nextTokenIds: nextTokenIds, cache: cache)
+    }
+}
+
+extension Qwen35Model: MTPHeadAttachable {
+    @discardableResult
+    public func attachSeparateMTPHead(from directory: URL) -> Bool {
+        languageModel.attachSeparateMTPHead(from: directory)
     }
 }

@@ -129,12 +129,20 @@ extension KVCache {
         .scalar(offset)
     }
 
-    // Default: declares no restoration capability at all.
-    public var isRestorable: Bool { false }
-    public func markSpeculationBoundary() {}
-    @discardableResult
-    public func rollbackToBoundary(discarding n: Int) -> Int { 0 }
-    public func commitBoundary() {}
+    // No default for isRestorable/markSpeculationBoundary/rollbackToBoundary/
+    // commitBoundary here (2026-07-20, mirroring isTrimmable/trim, which
+    // never had one): a protocol-extension default is exactly what let
+    // BaseKVCache's subclasses silently no-op through a `[KVCache]`
+    // existential — each subclass declared its own non-overriding member,
+    // which satisfied direct/concrete-type access but never the witness
+    // table fixed at BaseKVCache's conformance, so every existential call
+    // site (`canRestoreCache`, `rollbackToBoundary(_:discarding:)`, etc.)
+    // saw the extension's inert default regardless of the real type
+    // underneath. BaseKVCache now declares these `open` and its subclasses
+    // `override` them; any OTHER direct conformer to `KVCache` (not routed
+    // through BaseKVCache, e.g. mlx-chatd's `BatchedKVCache`) must provide
+    // its own explicit implementation — which is exactly what makes a
+    // direct conformer's dispatch correct in the first place.
 }
 
 /// Protocol for caches that support efficient quantized operations
@@ -212,6 +220,30 @@ open class BaseKVCache: KVCache {
 
     @discardableResult
     open func trim(_ n: Int) -> Int { 0 }
+
+    // MARK: - Speculative-decoding state restoration (MTP)
+    //
+    // Declared `open` here — not left to the `KVCache` protocol extension's
+    // default — for the same reason `isTrimmable`/`trim` are: every
+    // subclass in this file reaches these members through a `[KVCache]`
+    // existential array (`newCache(parameters:)`'s return type, `self.caches`
+    // in BatchEngine, `canRestoreCache(_:)`, etc.). A subclass that merely
+    // redeclares a same-named `var`/`func` WITHOUT `override` does not
+    // participate in dynamic dispatch through that existential — Swift
+    // resolves the call against the witness table fixed at *this* class's
+    // conformance to `KVCache`, which points at the protocol extension's
+    // default unless this class itself provides a dispatchable (`open`)
+    // implementation. That is exactly the bug this fixes (2026-07-20): every
+    // subclass (`KVCacheSimple`, `RotatingKVCache`, `QuantizedKVCache`,
+    // `MambaCache`) declared its own non-overriding `isRestorable`/etc.,
+    // which silently never fired through `[KVCache]` — `canRestoreCache`
+    // and `rollbackToBoundary(_:discarding:)` always saw the inert default,
+    // regardless of the concrete type underneath.
+    open var isRestorable: Bool { false }
+    open func markSpeculationBoundary() {}
+    @discardableResult
+    open func rollbackToBoundary(discarding n: Int) -> Int { 0 }
+    open func commitBoundary() {}
 
     open func copy() -> any KVCache {
         fatalError("copy() must be implemented by subclass")
@@ -465,9 +497,9 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
     // Speculative-decoding restoration: for a plain trimmable cache the
     // "position" is already implicit in `offset` — no snapshot needed, and
     // rollback is exactly `trim`.
-    public var isRestorable: Bool { isTrimmable }
+    public override var isRestorable: Bool { isTrimmable }
     @discardableResult
-    public func rollbackToBoundary(discarding n: Int) -> Int { trim(n) }
+    public override func rollbackToBoundary(discarding n: Int) -> Int { trim(n) }
 
     /// Convert to quantized cache for maximum efficiency
     ///
@@ -737,9 +769,9 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
         return trimmed
     }
 
-    public var isRestorable: Bool { isTrimmable }
+    public override var isRestorable: Bool { isTrimmable }
     @discardableResult
-    public func rollbackToBoundary(discarding n: Int) -> Int { trim(n) }
+    public override func rollbackToBoundary(discarding n: Int) -> Int { trim(n) }
 
     /// Optimized mask creation for rotating cache with offset capping
     public override func makeMask(
@@ -1087,9 +1119,9 @@ public class QuantizedKVCache: BaseKVCache, QuantizedKVCacheProtocol {
         return trimmed
     }
 
-    public var isRestorable: Bool { isTrimmable }
+    public override var isRestorable: Bool { isTrimmable }
     @discardableResult
-    public func rollbackToBoundary(discarding n: Int) -> Int { trim(n) }
+    public override func rollbackToBoundary(discarding n: Int) -> Int { trim(n) }
 
     public override func copy() -> any KVCache {
         let new = QuantizedKVCache(groupSize: groupSize, bits: bits, mode: mode)
@@ -1370,9 +1402,9 @@ public class MambaCache: ArraysCache {
     // tokens — so "snapshot whatever is here right now" is exactly "snapshot
     // the confirmed boundary".
 
-    public var isRestorable: Bool { true }
+    public override var isRestorable: Bool { true }
 
-    public func markSpeculationBoundary() {
+    public override func markSpeculationBoundary() {
         guard let conv = self[0], let ssm = self[1] else {
             speculationSnapshot = nil
             return
@@ -1387,7 +1419,7 @@ public class MambaCache: ArraysCache {
     /// caller detect the contract violation (Part-C §4) and fail closed rather
     /// than continue from an unknown state.
     @discardableResult
-    public func rollbackToBoundary(discarding n: Int) -> Int {
+    public override func rollbackToBoundary(discarding n: Int) -> Int {
         guard let snapshot = speculationSnapshot else { return 0 }
         self[0] = snapshot.0
         self[1] = snapshot.1
@@ -1395,7 +1427,7 @@ public class MambaCache: ArraysCache {
         return n
     }
 
-    public func commitBoundary() {
+    public override func commitBoundary() {
         speculationSnapshot = nil
     }
 

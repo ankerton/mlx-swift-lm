@@ -302,10 +302,22 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         let verifyLogProbs0 = logSoftmax(verifyLogits0, axis: -1)
         let draftTokenId = draftTok.item(Int.self)
 
+        // Fix (2026-07-20, confirmed by instrumentation before this landed —
+        // see the commit message): `verifyLogProbs0`/`draftLP` carry a
+        // leading batch-of-1 axis here ([1,V]) — correct for their other
+        // uses (`processor?.process`, `sampler.sample`, `argMax`, all of
+        // which expect a batch dimension), but `SpeculativeAcceptance`'s
+        // `[draftToken]` indexing assumes 1-D ([V]), matching the batched
+        // path's `rawLogits[i][0]` (a double literal-int index that
+        // genuinely squeezes both axes). Reshaping only at this call site —
+        // not the shared arrays themselves — keeps a single
+        // `SpeculativeAcceptance` implementation for both engines rather
+        // than forking it, and doesn't disturb any of `verifyLogProbs0`'s
+        // other consumers below.
         let accepted = SpeculativeAcceptance.accept(
             draftToken: draftTokenId,
-            targetLogProbs: verifyLogProbs0,
-            draftLogProbs: draftLP,
+            targetLogProbs: verifyLogProbs0.reshaped([-1]),
+            draftLogProbs: draftLP.reshaped([-1]),
             isGreedy: isGreedy,
             uniformDraw: isGreedy ? 0 : uniform().item(Float.self)
         )
@@ -346,7 +358,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
                 replacementTok = argMax(verifyLogits0, axis: -1)
             } else {
                 let residual = SpeculativeAcceptance.residualToken(
-                    targetLogProbs: verifyLogProbs0, draftLogProbs: draftLP)
+                    targetLogProbs: verifyLogProbs0.reshaped([-1]), draftLogProbs: draftLP.reshaped([-1]))
                 replacementTok = MLXArray(UInt32(residual)).reshaped([1])
             }
             processor?.didSample(token: replacementTok)

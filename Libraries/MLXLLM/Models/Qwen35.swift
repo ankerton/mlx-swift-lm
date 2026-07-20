@@ -837,9 +837,27 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
         }
         let scratchCache = newCache(parameters: nil)
         let restorable = canRestoreCache(scratchCache)
+        // Temporary diagnostic (2026-07-20): the reason string used to be a
+        // flat, unconditional sentence with no per-layer detail. The real
+        // served checkpoint reported `not restorable` despite every layer
+        // `newCache()` can produce (MambaCache / KVCacheSimple) being
+        // unconditionally `isRestorable == true` by static reading — this
+        // enriches the message with the offending indices/types so the next
+        // load tells us directly rather than requiring another synthetic
+        // repro. Remove once the discrepancy is understood.
+        let reason: String?
+        if restorable {
+            reason = nil
+        } else {
+            let bad = scratchCache.enumerated().compactMap { i, c -> String? in
+                c.isRestorable ? nil : "\(i):\(type(of: c))"
+            }
+            reason =
+                "one or more cache types in this model cannot be restored "
+                + "(non-restorable: [\(bad.joined(separator: ", "))] of \(scratchCache.count) total)"
+        }
         return SpeculationCapability(
-            hasHeads: true, allCachesRestorable: restorable, proposalDepth: 1,
-            reason: restorable ? nil : "one or more cache types in this model cannot be restored")
+            hasHeads: true, allCachesRestorable: restorable, proposalDepth: 1, reason: reason)
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {

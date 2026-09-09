@@ -339,34 +339,38 @@ final class Qwen35GatedDeltaNet: Module {
                 cache[1] = ssmC
                 cache.markSpeculationBoundary()
             }
-            // Draft tail, ONE token per chunk, snapshotting the recurrent
-            // state after each (2026-09-09, depth>1 speculation): a partial
-            // acceptance of `a` of the `S - confirmedPrefix` drafts then rolls
-            // back to snapshot `a` instead of recomputing. For a tail of one
-            // token this is exactly the previous single-chunk computation.
-            var outs: [MLXArray] = [outC]
-            var conv = convC
-            var ssm = ssmC
-            for t in confirmedPrefix ..< S {
-                let (outT, convT, ssmT) = processChunk(
-                    qkvChunk: qkv[0..., t ..< (t + 1)],
-                    aChunk: a[0..., t ..< (t + 1)],
-                    bChunk: b[0..., t ..< (t + 1)],
-                    convState: conv, ssmState: ssm,
-                    mask: mask?[0..., t ..< (t + 1)]
-                )
-                outs.append(outT)
-                conv = convT
-                ssm = ssmT
-                if let cache {
-                    // Optimistic advance through this draft token — rolled
-                    // back by the engine to the accepted boundary.
-                    cache[0] = convT
-                    cache[1] = ssmT
-                    cache.pushSpeculationSnapshot()
+            // Draft tail as ONE chunk (the cheap path — one recurrence
+            // kernel per layer, whatever the depth). A partial acceptance of
+            // `a` of the tail tokens needs the state after exactly `a` of
+            // them, which this chunk did not materialise; instead of
+            // processing the tail token-by-token every round (k× the op
+            // count, measured 2026-09-09 to cost more than it saves), the
+            // cache is handed a recompute closure: on rollback it re-runs the
+            // recurrence over just the accepted prefix, from the boundary
+            // state — only on rounds that partially accept, and only for the
+            // prefix lengths actually needed.
+            let tailQKV = qkv[0..., confirmedPrefix...]
+            let tailA = a[0..., confirmedPrefix...]
+            let tailB = b[0..., confirmedPrefix...]
+            let tailMask = mask?[0..., confirmedPrefix...]
+            let (outD, convF, ssmF) = processChunk(
+                qkvChunk: tailQKV, aChunk: tailA, bChunk: tailB,
+                convState: convC, ssmState: ssmC, mask: tailMask
+            )
+            if let cache {
+                // Optimistic advance through the draft tokens too — rolled
+                // back by the engine to the accepted boundary.
+                cache[0] = convF
+                cache[1] = ssmF
+                cache.setSpeculationTail(length: S - confirmedPrefix) { [self] keep in
+                    let (_, c, s) = self.processChunk(
+                        qkvChunk: tailQKV[0..., ..<keep], aChunk: tailA[0..., ..<keep],
+                        bChunk: tailB[0..., ..<keep],
+                        convState: convC, ssmState: ssmC, mask: tailMask?[0..., ..<keep])
+                    return (c, s)
                 }
             }
-            out = concatenated(outs, axis: 1)
+            out = concatenated([outC, outD], axis: 1)
         } else {
             let (outFull, convF, ssmF) = processChunk(
                 qkvChunk: qkv, aChunk: a, bChunk: b,

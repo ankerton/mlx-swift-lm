@@ -339,20 +339,34 @@ final class Qwen35GatedDeltaNet: Module {
                 cache[1] = ssmC
                 cache.markSpeculationBoundary()
             }
-            let (outD, convF, ssmF) = processChunk(
-                qkvChunk: qkv[0..., confirmedPrefix...],
-                aChunk: a[0..., confirmedPrefix...],
-                bChunk: b[0..., confirmedPrefix...],
-                convState: convC, ssmState: ssmC,
-                mask: mask?[0..., confirmedPrefix...]
-            )
-            if let cache {
-                // Optimistic advance through the draft tokens too — rolled
-                // back by the engine if verification rejects them.
-                cache[0] = convF
-                cache[1] = ssmF
+            // Draft tail, ONE token per chunk, snapshotting the recurrent
+            // state after each (2026-09-09, depth>1 speculation): a partial
+            // acceptance of `a` of the `S - confirmedPrefix` drafts then rolls
+            // back to snapshot `a` instead of recomputing. For a tail of one
+            // token this is exactly the previous single-chunk computation.
+            var outs: [MLXArray] = [outC]
+            var conv = convC
+            var ssm = ssmC
+            for t in confirmedPrefix ..< S {
+                let (outT, convT, ssmT) = processChunk(
+                    qkvChunk: qkv[0..., t ..< (t + 1)],
+                    aChunk: a[0..., t ..< (t + 1)],
+                    bChunk: b[0..., t ..< (t + 1)],
+                    convState: conv, ssmState: ssm,
+                    mask: mask?[0..., t ..< (t + 1)]
+                )
+                outs.append(outT)
+                conv = convT
+                ssm = ssmT
+                if let cache {
+                    // Optimistic advance through this draft token — rolled
+                    // back by the engine to the accepted boundary.
+                    cache[0] = convT
+                    cache[1] = ssmT
+                    cache.pushSpeculationSnapshot()
+                }
             }
-            out = concatenated([outC, outD], axis: 1)
+            out = concatenated(outs, axis: 1)
         } else {
             let (outFull, convF, ssmF) = processChunk(
                 qkvChunk: qkv, aChunk: a, bChunk: b,
@@ -735,6 +749,17 @@ final class Qwen35MTPHead: Module {
         _ hiddenState: MLXArray, nextTokenIds: MLXArray, embedTokens: Embedding,
         cache: [KVCache]
     ) -> MLXArray {
+        forwardChained(hiddenState, nextTokenIds: nextTokenIds, embedTokens: embedTokens, cache: cache)
+            .normed
+    }
+
+    /// Same forward, returning BOTH the block output (`preNorm`, the input for
+    /// a chained next draft step) and the normed hidden the logits are taken
+    /// from (2026-09-09, depth>1 drafting).
+    func forwardChained(
+        _ hiddenState: MLXArray, nextTokenIds: MLXArray, embedTokens: Embedding,
+        cache: [KVCache]
+    ) -> (preNorm: MLXArray, normed: MLXArray) {
         let e = preFcNormEmbedding(embedTokens(nextTokenIds))
         let h = preFcNormHidden(hiddenState)
         var fused = fc(concatenated([e, h], axis: -1))
@@ -744,7 +769,7 @@ final class Qwen35MTPHead: Module {
             fused = layer(fused, mask: mask, cache: c)
         }
 
-        return norm(fused)
+        return (fused, norm(fused))
     }
 }
 
@@ -954,6 +979,20 @@ extension Qwen35TextModel: MTPSpeculativeModel {
             hiddenState, nextTokenIds: nextTokenIds, embedTokens: model.embedTokens, cache: cache)
         return lmHead.map { $0(fused) } ?? model.embedTokens.asLinear(fused)
     }
+
+    public func mtpForwardChained(hiddenState: MLXArray, nextTokenIds: MLXArray, cache: [KVCache])
+        -> (logits: MLXArray, hidden: MLXArray)
+    {
+        guard let mtp else {
+            fatalError(
+                "mtpForwardChained called on a model with no MTP head — check speculationCapability first"
+            )
+        }
+        let (preNorm, normed) = mtp.forwardChained(
+            hiddenState, nextTokenIds: nextTokenIds, embedTokens: model.embedTokens, cache: cache)
+        let logits = lmHead.map { $0(normed) } ?? model.embedTokens.asLinear(normed)
+        return (logits, preNorm)
+    }
 }
 
 extension Qwen35TextModel: MTPHeadAttachable {
@@ -1135,6 +1174,13 @@ extension Qwen35Model: MTPSpeculativeModel {
         -> MLXArray
     {
         languageModel.mtpForward(hiddenState: hiddenState, nextTokenIds: nextTokenIds, cache: cache)
+    }
+
+    public func mtpForwardChained(hiddenState: MLXArray, nextTokenIds: MLXArray, cache: [KVCache])
+        -> (logits: MLXArray, hidden: MLXArray)
+    {
+        languageModel.mtpForwardChained(
+            hiddenState: hiddenState, nextTokenIds: nextTokenIds, cache: cache)
     }
 }
 

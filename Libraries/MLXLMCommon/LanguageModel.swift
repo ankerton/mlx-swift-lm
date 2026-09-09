@@ -321,6 +321,14 @@ public protocol MTPSpeculativeModel {
     /// is the already-sampled token(s) that follow it. Returns logits,
     /// `[B, N, vocab]`.
     func mtpForward(hiddenState: MLXArray, nextTokenIds: MLXArray, cache: [KVCache]) -> MLXArray
+
+    /// Depth>1 drafting (2026-09-09): like `mtpForward`, but ALSO returns the
+    /// head's own pre-final-norm output hidden state, `[B, N, H]` — the input
+    /// for the NEXT chained draft step (DeepSeek-V3 / Qwen3-Next MTP: module
+    /// k takes module k-1's block output, not the backbone's hidden). The
+    /// head's `norm` is applied only on the way to the logits.
+    func mtpForwardChained(hiddenState: MLXArray, nextTokenIds: MLXArray, cache: [KVCache])
+        -> (logits: MLXArray, hidden: MLXArray)
 }
 
 /// Conformed by models that can load their MTP head from a **separate**

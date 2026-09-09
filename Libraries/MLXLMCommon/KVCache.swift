@@ -112,6 +112,10 @@ public protocol KVCache: Evaluatable {
     /// `offset`); recurrent caches capture the state they cannot otherwise
     /// recover. Idempotent within a round.
     func markSpeculationBoundary()
+    /// Record the recurrent state after one more speculative tail token
+    /// (depth>1 speculation, 2026-09-09). No-op for attention caches, whose
+    /// per-position state is already addressable by `trim`.
+    func pushSpeculationSnapshot()
 
     /// Return the cache to the position implied by discarding the last `n`
     /// tokens. Returns the count actually discarded — a return `!= n` is a
@@ -241,6 +245,7 @@ open class BaseKVCache: KVCache {
     // regardless of the concrete type underneath.
     open var isRestorable: Bool { false }
     open func markSpeculationBoundary() {}
+    open func pushSpeculationSnapshot() {}
     @discardableResult
     open func rollbackToBoundary(discarding n: Int) -> Int { 0 }
     open func commitBoundary() {}
@@ -1386,10 +1391,17 @@ public class MambaCache: ArraysCache {
         super.init(size: 2, leftPadding: leftPadding)
     }
 
-    /// Snapshot of (conv, ssm) state taken at the confirmed/speculative
-    /// boundary by `markSpeculationBoundary()`. Cleared by `commitBoundary()`
-    /// or consumed by `rollbackToBoundary`. See MTP speculative decoding.
-    private var speculationSnapshot: (MLXArray, MLXArray)?
+    /// Snapshots of (conv, ssm) state along the speculative tail (2026-09-09,
+    /// depth>1): index 0 = the confirmed boundary (`markSpeculationBoundary`),
+    /// index j = the state after the j-th draft token (`pushSpeculationSnapshot`,
+    /// called by the recurrent layer after each tail token). A row that
+    /// accepted `a` of `k` drafts rolls back to index `a`. Cleared by
+    /// `commitBoundary()` or consumed by a rollback. References only — no
+    /// copies: each entry is the array the forward produced anyway.
+    private var speculationSnapshots: [(MLXArray, MLXArray)] = []
+    /// The boundary snapshot alone, for the depth-1 code paths that only ever
+    /// need "back to the confirmed boundary".
+    private var speculationSnapshot: (MLXArray, MLXArray)? { speculationSnapshots.first }
 
     // MARK: - Speculative-decoding state restoration
     //
@@ -1411,10 +1423,17 @@ public class MambaCache: ArraysCache {
 
     public override func markSpeculationBoundary() {
         guard let conv = self[0], let ssm = self[1] else {
-            speculationSnapshot = nil
+            speculationSnapshots = []
             return
         }
-        speculationSnapshot = (conv, ssm)
+        speculationSnapshots = [(conv, ssm)]
+    }
+
+    /// Record the state after one more speculative token (see
+    /// `speculationSnapshots`). No-op unless a boundary was marked first.
+    public override func pushSpeculationSnapshot() {
+        guard !speculationSnapshots.isEmpty, let conv = self[0], let ssm = self[1] else { return }
+        speculationSnapshots.append((conv, ssm))
     }
 
     /// Single-stream (batch-of-one) restore: `n` is unused beyond echoing it
@@ -1425,15 +1444,44 @@ public class MambaCache: ArraysCache {
     /// than continue from an unknown state.
     @discardableResult
     public override func rollbackToBoundary(discarding n: Int) -> Int {
-        guard let snapshot = speculationSnapshot else { return 0 }
+        defer { speculationSnapshots = [] }
+        guard !speculationSnapshots.isEmpty else { return 0 }
+        // Discard the last `n` tail tokens: land on snapshot `tail - n`
+        // (index 0 = the boundary). A request past the boundary is clamped
+        // to the boundary and reported as such.
+        let tail = speculationSnapshots.count - 1
+        let keep = max(tail - n, 0)
+        let snapshot = speculationSnapshots[keep]
         self[0] = snapshot.0
         self[1] = snapshot.1
-        speculationSnapshot = nil
-        return n
+        return tail - keep
     }
 
     public override func commitBoundary() {
-        speculationSnapshot = nil
+        speculationSnapshots = []
+    }
+
+    /// Per-row, per-COUNT rollback (2026-09-09, depth>1): `counts[i]` is how
+    /// many trailing tail tokens row i discards — `0` for a row that accepted
+    /// every draft (left exactly as the optimistic forward advanced it), `k`
+    /// for a row that rejected the first draft (back to the boundary). Rows
+    /// with the same count are restored together with one masked `where`
+    /// per distinct count. Always consumes the snapshots.
+    public func rollbackToBoundary(discardingCounts counts: [Int]) {
+        defer { speculationSnapshots = [] }
+        guard !speculationSnapshots.isEmpty, let conv = self[0], let ssm = self[1] else { return }
+        let tail = speculationSnapshots.count - 1
+        var newConv = conv
+        var newSsm = ssm
+        for target in Set(counts) where target > 0 {
+            let keep = max(tail - target, 0)
+            let snapshot = speculationSnapshots[keep]
+            let rows = MLXArray(counts.map { $0 == target })
+            newConv = MLX.where(Self.broadcastRowMask(rows, like: newConv), snapshot.0, newConv)
+            newSsm = MLX.where(Self.broadcastRowMask(rows, like: newSsm), snapshot.1, newSsm)
+        }
+        self[0] = newConv
+        self[1] = newSsm
     }
 
     /// Batched variant: restore only the rows where `reject` is `true`,
@@ -1450,7 +1498,7 @@ public class MambaCache: ArraysCache {
     /// `reject` is a `[B]` boolean `MLXArray` (`true` = restore this row from
     /// the snapshot). Always consumes (clears) the snapshot.
     public func rollbackToBoundary(discardingRows reject: MLXArray) {
-        defer { speculationSnapshot = nil }
+        defer { speculationSnapshots = [] }
         guard let snapshot = speculationSnapshot,
             let conv = self[0], let ssm = self[1]
         else { return }

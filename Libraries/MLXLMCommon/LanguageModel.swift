@@ -222,7 +222,8 @@ public protocol LanguageModel: BaseLanguageModel {
     /// in the fork conforms unchanged. Only the Qwen3.5/3.6 text path honours
     /// `confirmedPrefix`.
     ///
-    /// `hidden` is the backbone's pre-final-norm hidden state, needed by
+    /// `hidden` is the backbone's post-final-norm hidden state (the tensor the
+    /// lm_head reads; measured 2026-09-13 to be what the MTP head expects), needed by
     /// ``MTPSpeculativeModel/mtpForward(hiddenState:nextTokenIds:cache:)``.
     /// `nil` for models without an MTP head. Shapes are otherwise unchanged:
     /// input `[B, L]`, `logits` `[B, L, V]`.
@@ -315,7 +316,7 @@ public protocol MTPSpeculativeModel {
     func makeMTPCache() -> [KVCache]
 
     /// Run the MTP head and apply the shared `lm_head`/embedding-as-linear, the
-    /// same way the backbone does. `hiddenState` is the backbone's **pre-final-
+    /// same way the backbone does. `hiddenState` is the backbone's **post-final-
     /// norm** hidden state (see the `hidden` component of
     /// ``LanguageModel/callAsFunction(_:cache:confirmedPrefix:)``); `nextTokenIds`
     /// is the already-sampled token(s) that follow it. Returns logits,

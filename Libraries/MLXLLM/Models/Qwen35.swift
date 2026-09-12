@@ -663,7 +663,7 @@ public class Qwen35TextModelInner: Module {
 // MARK: - MTP (multi-token-prediction) head
 //
 // ml-explore/mlx-lm#990 (reference to port; Part-A §4). Predicts token `t+2`
-// from the backbone's pre-final-norm hidden state at `t` and the (sampled)
+// from the backbone's post-final-norm hidden state at `t` and the (sampled)
 // token `t+1`'s embedding. No second resident model — the fused head lives
 // inside Qwen3.6's own checkpoint.
 //
@@ -741,7 +741,8 @@ final class Qwen35MTPHead: Module {
     }
 
     /// - Parameters:
-    ///   - hiddenState: backbone pre-final-norm hidden state, `[B, N, H]`.
+    ///   - hiddenState: backbone post-final-norm hidden state, `[B, N, H]`
+    ///     (first draft), or the head's own pre-norm block output (chained drafts).
     ///   - nextTokenIds: the token(s) positionally following `hiddenState`, `[B, N]`.
     ///   - embedTokens: the backbone's embedding table (shared — not duplicated
     ///     here; `mtp_use_dedicated_embeddings` is not supported, see
@@ -831,14 +832,20 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     /// Speculative-decoding-aware forward (Part-C §1.2). Additive: the plain
     /// `callAsFunction(_:cache:)` above is untouched. `confirmedPrefix` reaches
     /// the linear-attention layers, which use it as their snapshot boundary;
-    /// `hidden` is the pre-final-norm state the MTP head needs.
+    /// `hidden` is the post-final-norm state the MTP head needs (see below).
     public func callAsFunction(
         _ inputs: MLXArray, cache: [KVCache]?, confirmedPrefix: Int
     ) -> (logits: MLXArray, hidden: MLXArray?) {
         let preNorm = model.hiddenStates(inputs, cache: cache, confirmedPrefix: confirmedPrefix)
         let normed = model.norm(preNorm)
         let logits = lmHead.map { $0(normed) } ?? model.embedTokens.asLinear(normed)
-        return (logits, preNorm)
+        // The MTP head takes the backbone's POST-final-norm hidden state (the
+        // same tensor the lm_head reads), as vLLM's Qwen3-Next MTP proposer
+        // does. Measured 2026-09-13 (Qwen3.8-27B, EigenLabs head, greedy, depth
+        // 3): first-draft acceptance 79.6% vs 63.7–72.6% when fed the pre-norm
+        // state; chained positions 53.6% / 30.8% vs 38.5–47.9% / 18.8–19.5%.
+        // MLX_CHATD_MTP_SEED_PRENORM=1 restores the old behaviour for A/B.
+        return (logits, Self.seedPreNorm ? preNorm : normed)
     }
 
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
@@ -984,6 +991,9 @@ extension Qwen35TextModel: MTPSpeculativeModel {
         return lmHead.map { $0(fused) } ?? model.embedTokens.asLinear(fused)
     }
 
+    static let chainNormed = ProcessInfo.processInfo.environment["MLX_CHATD_MTP_CHAIN_NORMED"] == "1"
+    static let seedPreNorm = ProcessInfo.processInfo.environment["MLX_CHATD_MTP_SEED_PRENORM"] == "1"
+
     public func mtpForwardChained(hiddenState: MLXArray, nextTokenIds: MLXArray, cache: [KVCache])
         -> (logits: MLXArray, hidden: MLXArray)
     {
@@ -995,7 +1005,11 @@ extension Qwen35TextModel: MTPSpeculativeModel {
         let (preNorm, normed) = mtp.forwardChained(
             hiddenState, nextTokenIds: nextTokenIds, embedTokens: model.embedTokens, cache: cache)
         let logits = lmHead.map { $0(normed) } ?? model.embedTokens.asLinear(normed)
-        return (logits, preNorm)
+        // Chained drafting feeds the head's PRE-norm block output back as the
+        // next step's hidden state. Measured 2026-09-13 against feeding the
+        // post-norm output: 79.6/53.6/30.8% per position vs 69.2/46.0/24.3%.
+        // MLX_CHATD_MTP_CHAIN_NORMED=1 selects the post-norm variant for A/B.
+        return (logits, Self.chainNormed ? normed : preNorm)
     }
 }
 

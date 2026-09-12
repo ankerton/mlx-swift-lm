@@ -38,17 +38,21 @@ public func loadWeights(
 
     // quantize if needed
     if quantization != nil || perLayerQuantization != nil {
-        quantize(model: model) { path, module in
-            if weights["\(path).scales"] != nil {
-                if let perLayerQuantization {
-                    return perLayerQuantization.quantization(layer: path)?.asTuple
+        quantize(
+            model: model,
+            filter: { path, module in
+                if weights["\(path).scales"] != nil {
+                    if let perLayerQuantization {
+                        return perLayerQuantization.quantization(layer: path)?.asTuple
+                    } else {
+                        return quantization?.asTuple
+                    }
                 } else {
-                    return quantization?.asTuple
+                    return nil
                 }
-            } else {
-                return nil
-            }
-        }
+            },
+            // Small-batch 8-bit fast path for Linear layers (FastQuantizedLinear).
+            apply: fastQuantizeSingle(layer:groupSize:bits:mode:))
     }
 
     // apply the loaded weights

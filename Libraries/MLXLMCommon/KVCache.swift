@@ -1403,6 +1403,20 @@ public class MambaCache: ArraysCache {
     /// `keep == length` the current state.
     private var speculationTailLength = 0
     private var speculationTailRecompute: ((Int) -> (MLXArray, MLXArray?))?
+    /// Per-token states over the whole verify chunk (`[S, B, …]`, index t =
+    /// state after token t) and the index of the confirmed boundary within
+    /// them. When set, rollback is an index, not a recompute (2026-09-13).
+    private var speculationStates: (conv: MLXArray, ssm: MLXArray, boundary: Int)?
+
+    /// Hand the cache every per-token state of the chunk just processed:
+    /// `conv[t]`/`ssm[t]` = state after token t; `boundary` = index of the
+    /// last confirmed token; `tail` = number of speculative tokens after it.
+    public func setSpeculationStates(conv: MLXArray, ssm: MLXArray, boundary: Int, tail: Int) {
+        speculationStates = (conv, ssm, boundary)
+        speculationSnapshot = (conv[boundary], ssm[boundary])
+        speculationTailLength = tail
+        speculationTailRecompute = nil
+    }
 
     // MARK: - Speculative-decoding state restoration
     //
@@ -1442,6 +1456,10 @@ public class MambaCache: ArraysCache {
 
     /// State after the first `keep` tail tokens: boundary, recompute, or current.
     private func stateKeeping(_ keep: Int, current: (MLXArray, MLXArray)) -> (MLXArray, MLXArray)? {
+        if let st = speculationStates {
+            let idx = min(max(st.boundary + keep, 0), st.ssm.dim(0) - 1)
+            return (st.conv[idx], st.ssm[idx])
+        }
         if keep <= 0 { return speculationSnapshot }
         if keep >= speculationTailLength { return current }
         guard let recompute = speculationTailRecompute else { return speculationSnapshot }
@@ -1480,6 +1498,7 @@ public class MambaCache: ArraysCache {
         speculationSnapshot = nil
         speculationTailLength = 0
         speculationTailRecompute = nil
+        speculationStates = nil
     }
 
     /// Per-row, per-COUNT rollback (2026-09-09, depth>1): `counts[i]` is how

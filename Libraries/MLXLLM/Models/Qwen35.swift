@@ -176,6 +176,8 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
 // MARK: - GatedDeltaNet
 
 final class Qwen35GatedDeltaNet: Module {
+    /// A/B switch: MLX_CHATD_GDN_SPLIT=1 restores the two-chunk verify path.
+    static let splitVerify = ProcessInfo.processInfo.environment["MLX_CHATD_GDN_SPLIT"] == "1"
     let hiddenSize: Int
     let numVHeads: Int
     let numKHeads: Int
@@ -324,7 +326,40 @@ final class Qwen35GatedDeltaNet: Module {
 
         let out: MLXArray
 
-        if confirmedPrefix > 0 && confirmedPrefix < S {
+        if confirmedPrefix > 0 && confirmedPrefix < S && !Self.splitVerify {
+            // Speculative verify, single pass (2026-09-13): the whole
+            // [confirmed | drafts] chunk runs through ONE recurrence kernel
+            // that materialises the state after every token; the cache gets
+            // all of them and rolls back to any accepted prefix by index.
+            // Replaces the two-chunk + recompute-closure path below (kept
+            // behind MLX_CHATD_GDN_SPLIT=1 for A/B), which cost ~7 ms per
+            // verify on Qwen3.8-27B (48 layers × an extra chunk).
+            var qkvM = qkv
+            if let mask { qkvM = MLX.where(mask[.ellipsis, .newAxis], qkvM, 0) }
+            let convInput = concatenated([initialConvState, qkvM], axis: 1)      // [B, S+K-1, C]
+            let convOut = silu(conv1d(convInput))
+            let convSplit = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
+            let q = convSplit[0].reshaped(B, S, numKHeads, headKDim)
+            let k = convSplit[1].reshaped(B, S, numKHeads, headKDim)
+            let v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
+            let dtype = q.dtype
+            let invScale = pow(Float(headKDim), -0.5)
+            let qNormed = MLXArray(pow(invScale, 2)).asType(dtype) * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
+            let kNormed = MLXArray(invScale).asType(dtype) * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+            let (outAll, ssmAll) = gatedDeltaUpdateAllStates(
+                q: qNormed, k: kNormed, v: v, a: a, b: b, aLog: aLog, dtBias: dtBias,
+                state: initialSsmState, mask: mask)                              // ssmAll [S, B, Hv, Dv, Dk]
+            // Conv state after token t = the last K-1 rows of convInput up to t.
+            let convStates = MLX.stacked(
+                (0 ..< S).map { t in convInput[0..., (t + 1) ..< (t + convKernelSize)] }, axis: 0)  // [S, B, K-1, C]
+            if let cache {
+                cache[0] = convStates[S - 1]
+                cache[1] = ssmAll[S - 1]
+                cache.setSpeculationStates(conv: convStates, ssm: ssmAll,
+                                           boundary: confirmedPrefix - 1, tail: S - confirmedPrefix)
+            }
+            out = outAll
+        } else if confirmedPrefix > 0 && confirmedPrefix < S {
             let (outC, convC, ssmC) = processChunk(
                 qkvChunk: qkv[0..., ..<confirmedPrefix],
                 aChunk: a[0..., ..<confirmedPrefix],

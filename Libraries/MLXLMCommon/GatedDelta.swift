@@ -18,8 +18,24 @@ func computeGatedDeltaG(_ aLog: MLXArray, _ a: MLXArray, _ dtBias: MLXArray) -> 
 
 // MARK: - Metal Kernel
 
-private func makeGatedDeltaKernel(hasMask: Bool) -> MLXFast.MLXFastKernel? {
+private func makeGatedDeltaKernel(hasMask: Bool, allStates: Bool = false) -> MLXFast.MLXFastKernel? {
     let maskSource = hasMask ? "mask[b_idx * T + t]" : "true"
+    // allStates: write the recurrent state after EVERY token into
+    // state_out[t] ([T, B, Hv, Dv, Dk], STRIDE = B*Hv*Dv*Dk elements per t)
+    // instead of only the final state — lets speculative decoding roll back
+    // to any accepted prefix without a second pass (2026-09-13).
+    let perTokenWrite = allStates ? """
+                  for (int i = 0; i < n_per_t; ++i) {
+                    auto s_idx = n_per_t * dk_idx + i;
+                    o_state[t * STRIDE + s_idx] = static_cast<StT>(state[i]);
+                  }
+        """ : ""
+    let finalWrite = allStates ? "" : """
+            for (int i = 0; i < n_per_t; ++i) {
+              auto s_idx = n_per_t * dk_idx + i;
+              o_state[s_idx] = static_cast<StT>(state[i]);
+            }
+        """
 
     let source = """
             auto n = thread_position_in_grid.z;
@@ -78,6 +94,7 @@ private func makeGatedDeltaKernel(hasMask: Bool) -> MLXFast.MLXFastKernel? {
               } else {
                 y[dv_idx] = static_cast<InT>(0);
               }
+              \(perTokenWrite)
               // Increment data pointers to next time step
               q_ += Hk * Dk;
               k_ += Hk * Dk;
@@ -86,10 +103,7 @@ private func makeGatedDeltaKernel(hasMask: Bool) -> MLXFast.MLXFastKernel? {
               g_ += Hv;
               beta_ += Hv;
             }
-            for (int i = 0; i < n_per_t; ++i) {
-              auto s_idx = n_per_t * dk_idx + i;
-              o_state[s_idx] = static_cast<StT>(state[i]);
-            }
+            \(finalWrite)
         """
 
     var inputNames = ["q", "k", "v", "g", "beta", "state_in", "T"]
@@ -97,7 +111,7 @@ private func makeGatedDeltaKernel(hasMask: Bool) -> MLXFast.MLXFastKernel? {
         inputNames.append("mask")
     }
 
-    let suffix = hasMask ? "_mask" : ""
+    let suffix = (hasMask ? "_mask" : "") + (allStates ? "_all" : "")
 
     return MLXFast.metalKernel(
         name: "gated_delta_step\(suffix)",
@@ -112,10 +126,14 @@ private final class GatedDeltaKernelManager: Sendable {
 
     let kernel: MLXFast.MLXFastKernel?
     let kernelMasked: MLXFast.MLXFastKernel?
+    let kernelAll: MLXFast.MLXFastKernel?
+    let kernelAllMasked: MLXFast.MLXFastKernel?
 
     private init() {
         kernel = makeGatedDeltaKernel(hasMask: false)
         kernelMasked = makeGatedDeltaKernel(hasMask: true)
+        kernelAll = makeGatedDeltaKernel(hasMask: false, allStates: true)
+        kernelAllMasked = makeGatedDeltaKernel(hasMask: true, allStates: true)
     }
 }
 
@@ -169,6 +187,82 @@ func gatedDeltaKernel(
     )
 
     return (outputs[0], outputs[1])
+}
+
+/// All-states variant of `gatedDeltaKernel`: returns `(y, states)` with
+/// `states` of shape `[T, B, Hv, Dv, Dk]` — the recurrent state after each
+/// of the T tokens (`states[T-1]` is what `gatedDeltaKernel` returns).
+func gatedDeltaKernelAllStates(
+    q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray, beta: MLXArray,
+    state: MLXArray, mask: MLXArray? = nil
+) -> (MLXArray, MLXArray) {
+    let B = k.dim(0)
+    let T = k.dim(1)
+    let Hk = k.dim(2)
+    let Dk = k.dim(3)
+    let Hv = v.dim(2)
+    let Dv = v.dim(3)
+    let inputType = q.dtype
+    let stateType = state.dtype
+    var inputs: [MLXArray] = [q, k, v, g, beta, state, MLXArray(T)]
+    let selected: MLXFast.MLXFastKernel?
+    if let mask {
+        selected = GatedDeltaKernelManager.shared.kernelAllMasked
+        inputs.append(mask)
+    } else {
+        selected = GatedDeltaKernelManager.shared.kernelAll
+    }
+    guard let kernel = selected else { fatalError("Gated delta all-states kernel not available") }
+    let outputs = kernel(
+        inputs,
+        template: [
+            ("InT", inputType), ("StT", stateType),
+            ("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv),
+            ("STRIDE", B * Hv * Dv * Dk),
+        ],
+        grid: (32, Dv, B * Hv),
+        threadGroup: (32, 4, 1),
+        outputShapes: [[B, T, Hv, Dv], [T] + state.shape],
+        outputDTypes: [inputType, stateType]
+    )
+    return (outputs[0], outputs[1])
+}
+
+/// `gatedDeltaUpdate` that also materialises the state after every token:
+/// `(y, states[T, B, Hv, Dv, Dk])`. Used by speculative verification so a
+/// partial acceptance can restore the exact state after the accepted prefix
+/// with an index instead of a second recurrence pass.
+public func gatedDeltaUpdateAllStates(
+    q: MLXArray, k: MLXArray, v: MLXArray, a: MLXArray, b: MLXArray,
+    aLog: MLXArray, dtBias: MLXArray, state: MLXArray? = nil, mask: MLXArray? = nil
+) -> (MLXArray, MLXArray) {
+    let beta = sigmoid(b).asType(.float32)
+    let g = computeGatedDeltaG(aLog, a, dtBias)
+    let B = q.dim(0)
+    let T = q.dim(1)
+    let Dk = q.dim(3)
+    let Hv = v.dim(2)
+    let Dv = v.dim(3)
+    var st = state ?? MLXArray.zeros([B, Hv, Dv, Dk], dtype: .float32)
+    if st.dtype != .float32 { st = st.asType(.float32) }
+    if GatedDeltaKernelManager.shared.kernelAll != nil {
+        return gatedDeltaKernelAllStates(q: q, k: k, v: v, g: g, beta: beta, state: st, mask: mask)
+    }
+    // Ops fallback: step once per token, collecting states.
+    var qq = q, kk = k
+    let repeatFactor = Hv / q.dim(2)
+    if repeatFactor > 1 {
+        qq = repeated(qq, count: repeatFactor, axis: -2)
+        kk = repeated(kk, count: repeatFactor, axis: -2)
+    }
+    var ys: [MLXArray] = [], states: [MLXArray] = []
+    for t in 0 ..< T {
+        let (y, ns) = gatedDeltaStepOps(
+            q: qq[0..., t], k: kk[0..., t], v: v[0..., t], g: g[0..., t], beta: beta[0..., t],
+            state: st, mask: mask == nil ? nil : mask![0..., t])
+        ys.append(y); states.append(ns); st = ns
+    }
+    return (MLX.stacked(ys, axis: 1), MLX.stacked(states, axis: 0))
 }
 
 // MARK: - Ops Fallback

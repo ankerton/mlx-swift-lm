@@ -115,9 +115,9 @@ public struct Mistral4Configuration: Codable, Sendable {
         ropeParameters =
             try c.decodeIfPresent([String: StringOrNumber].self, forKey: .ropeParameters)
             ?? c.decodeIfPresent([String: StringOrNumber].self, forKey: .ropeScaling)
-        ropeTheta =
-            ropeParameters?["rope_theta"]?.asFloat()
-            ?? (try c.decodeIfPresent(Float.self, forKey: .ropeTheta)) ?? 10_000
+        let fromParameters = ropeParameters?["rope_theta"]?.asFloat()
+        let direct = try c.decodeIfPresent(Float.self, forKey: .ropeTheta)
+        ropeTheta = fromParameters ?? direct ?? 10_000
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -406,4 +406,6 @@ public class Mistral4Model: Module, LLMModel, KVCacheDimensionProvider {
         }
         return w
     }
+
+    public var loraLayers: [Module] { model.layers }
 }

@@ -502,6 +502,11 @@ private class NemotronHMoE: Module, UnaryLayer, NemotronHMixer {
     @ModuleInfo(key: "gate") var gate: NemotronHMoEGate
     @ModuleInfo(key: "switch_mlp") var switchMLP: NemotronHSwitchMLP
     @ModuleInfo(key: "shared_experts") var sharedExperts: NemotronHMLP?
+    // Latent MoE (Nemotron-3-Super, `moe_latent_size`): the routed experts work in a
+    // smaller space; the input is projected down before them and back up after.
+    // The gate and the shared expert keep the full hidden size (mlx-lm nemotron_h.py).
+    @ModuleInfo(key: "fc1_latent_proj") var fc1LatentProj: Linear?
+    @ModuleInfo(key: "fc2_latent_proj") var fc2LatentProj: Linear?
 
     init(_ args: NemotronHConfiguration) {
         self.numExpertsPerTok = args.numExpertsPerTok
@@ -509,10 +514,14 @@ private class NemotronHMoE: Module, UnaryLayer, NemotronHMixer {
 
         self._gate.wrappedValue = NemotronHMoEGate(args)
         self._switchMLP.wrappedValue = NemotronHSwitchMLP(
-            inputDims: args.hiddenSize,
+            inputDims: args.moeLatentSize ?? args.hiddenSize,
             hiddenDims: args.moeIntermediateSize,
             numExperts: args.nRoutedExperts
         )
+        if let latent = args.moeLatentSize {
+            self._fc1LatentProj.wrappedValue = Linear(args.hiddenSize, latent, bias: args.mlpBias)
+            self._fc2LatentProj.wrappedValue = Linear(latent, args.hiddenSize, bias: args.mlpBias)
+        }
 
         if hasSharedExperts {
             self._sharedExperts.wrappedValue = NemotronHMLP(
@@ -526,8 +535,10 @@ private class NemotronHMoE: Module, UnaryLayer, NemotronHMixer {
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         let (inds, scores) = gate(x)
-        var y = switchMLP(x, inds)
+        let expertInput = fc1LatentProj.map { $0(x) } ?? x
+        var y = switchMLP(expertInput, inds)
         y = weightedExpertSum(y, scores).asType(y.dtype)
+        if let fc2LatentProj { y = fc2LatentProj(y) }
 
         if let sharedExperts {
             y = y + sharedExperts(x)
@@ -757,6 +768,8 @@ public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAMod
         var sanitized = [String: MLXArray]()
 
         for (key, value) in weights {
+            // The multi-token-prediction head (Nemotron-3-Super) is not part of this model.
+            if key.hasPrefix("mtp.") { continue }
             var finalValue = value
 
             // Handle conv1d weight axis swap
@@ -811,6 +824,8 @@ public struct NemotronHConfiguration: Codable, Sendable {
     public var nGroups: Int
     public var intermediateSize: Int
     public var moeIntermediateSize: Int
+    /// Latent MoE width (Nemotron-3-Super); nil = experts work at the hidden size.
+    public var moeLatentSize: Int?
     public var moeSharedExpertIntermediateSize: Int
     public var nRoutedExperts: Int
     public var nSharedExperts: Int?
@@ -846,6 +861,7 @@ public struct NemotronHConfiguration: Codable, Sendable {
         case nGroups = "n_groups"
         case intermediateSize = "intermediate_size"
         case moeIntermediateSize = "moe_intermediate_size"
+        case moeLatentSize = "moe_latent_size"
         case moeSharedExpertIntermediateSize = "moe_shared_expert_intermediate_size"
         case nRoutedExperts = "n_routed_experts"
         case nSharedExperts = "n_shared_experts"
@@ -884,6 +900,7 @@ public struct NemotronHConfiguration: Codable, Sendable {
         nGroups = try container.decode(Int.self, forKey: .nGroups)
         intermediateSize = try container.decode(Int.self, forKey: .intermediateSize)
         moeIntermediateSize = try container.decode(Int.self, forKey: .moeIntermediateSize)
+        moeLatentSize = try container.decodeIfPresent(Int.self, forKey: .moeLatentSize)
         moeSharedExpertIntermediateSize = try container.decode(
             Int.self, forKey: .moeSharedExpertIntermediateSize)
         nRoutedExperts = try container.decode(Int.self, forKey: .nRoutedExperts)

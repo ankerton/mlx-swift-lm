@@ -14,6 +14,19 @@ private func create<C: Codable, M>(
     }
 }
 
+/// A `mistral3` checkpoint is Mistral Small 3.x (dense) or, when its text model is `mistral4`,
+/// Mistral Small 4 (latent attention and experts): the text config's own model_type decides.
+private func createMistral3Family(_ data: Data) throws -> LanguageModel {
+    struct Probe: Codable {
+        struct Text: Codable { var model_type: String? }
+        var text_config: Text?
+    }
+    if (try? JSONDecoder.json5().decode(Probe.self, from: data))?.text_config?.model_type == "mistral4" {
+        return Mistral4Model(try JSONDecoder.json5().decode(Mistral4Configuration.self, from: data))
+    }
+    return Mistral3TextModel(try JSONDecoder.json5().decode(Mistral3TextConfiguration.self, from: data))
+}
+
 /// Registry of model type, e.g 'llama', to functions that can instantiate the model from configuration.
 ///
 /// Typically called via ``LLMModelFactory/loadContainer(from:using:configuration:useLatest:progressHandler:)``.
@@ -74,7 +87,7 @@ public enum LLMTypeRegistry {
         "nemotron_h": create(NemotronHConfiguration.self, NemotronHModel.init),
         "afmoe": create(AfMoEConfiguration.self, AfMoEModel.init),
         "jamba": create(JambaConfiguration.self, JambaModel.init),
-        "mistral3": create(Mistral3TextConfiguration.self, Mistral3TextModel.init),
+        "mistral3": createMistral3Family,
         "apertus": create(ApertusConfiguration.self, ApertusModel.init),
     ])
 }

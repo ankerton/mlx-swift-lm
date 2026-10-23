@@ -87,7 +87,9 @@ public struct BaseConfiguration: Codable, Sendable {
         /// - Parameter layer: The path/name of the layer.
         /// - Returns: The `Quantization` settings to apply, or `nil` if the layer should be skipped.
         public func quantization(layer: String) -> Quantization? {
-            if let perLayer = perLayerQuantization[layer] {
+            // A VLM checkpoint loaded as its text model names layers under `language_model.`
+            // in config.json, while the model's own paths drop that prefix (Mistral Small 4's 8-bit gates).
+            if let perLayer = perLayerQuantization[layer] ?? perLayerQuantization["language_model.\(layer)"] {
                 switch perLayer {
                 case .skip:
                     return nil
